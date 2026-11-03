@@ -66,6 +66,8 @@ pub fn walk_content_graph<S: Store>(
         .collect();
     let mut visiting = HashSet::<Cid>::new();
     let mut seen = HashSet::<Cid>::new();
+    // Longest descendant path, in edges, below each completed object.
+    let mut heights = HashMap::<Cid, usize>::new();
     let mut contexts = HashMap::<Cid, (ContentObjectKind, Option<u32>)>::new();
     let mut pending = HashMap::<Cid, TypedContentObject>::new();
     let mut formats = OrderedFormats::default();
@@ -88,6 +90,16 @@ pub fn walk_content_graph<S: Store>(
                     }
                 }
                 if seen.contains(&root.cid) {
+                    // The object is already loaded, but this path may be
+                    // longer: check the deepest descendant along it.
+                    let deepest =
+                        depth.saturating_add(heights.get(&root.cid).copied().ok_or_else(|| {
+                            invalid("completed content object has no recorded height")
+                        })?);
+                    if deepest > limits.max_depth {
+                        return Err(limit("depth", limits.max_depth, deepest));
+                    }
+                    walk.maximum_depth = walk.maximum_depth.max(deepest);
                     continue;
                 }
                 if !visiting.insert(root.cid.clone()) {
@@ -122,13 +134,18 @@ pub fn walk_content_graph<S: Store>(
                     depth,
                 };
                 pending.insert(root.cid.clone(), object);
-                stack.push(Frame::Exit(root.cid));
+                let children = references
+                    .iter()
+                    .map(|reference| reference.cid.clone())
+                    .collect();
+                stack.push(Frame::Exit(root.cid, children));
                 for reference in references.into_iter().rev() {
                     stack.push(Frame::Enter(reference, depth + 1));
                 }
             }
-            Frame::Exit(cid) => {
+            Frame::Exit(cid, children) => {
                 visiting.remove(&cid);
+                heights.insert(cid.clone(), subtree_height(&heights, &children)?);
                 if seen.insert(cid.clone()) {
                     let object = pending.remove(&cid).expect("entered content object");
                     walk.total_bytes = walk.total_bytes.saturating_add(object.bytes.len());
@@ -163,6 +180,8 @@ where
         .collect();
     let mut visiting = HashSet::<Cid>::new();
     let mut seen = HashSet::<Cid>::new();
+    // Longest descendant path, in edges, below each completed object.
+    let mut heights = HashMap::<Cid, usize>::new();
     let mut contexts = HashMap::<Cid, (ContentObjectKind, Option<u32>)>::new();
     let mut pending = HashMap::<Cid, TypedContentObject>::new();
     let mut formats = OrderedFormats::default();
@@ -187,6 +206,16 @@ where
                     }
                 }
                 if seen.contains(&root.cid) {
+                    // The object is already loaded, but this path may be
+                    // longer: check the deepest descendant along it.
+                    let deepest =
+                        depth.saturating_add(heights.get(&root.cid).copied().ok_or_else(|| {
+                            invalid("completed content object has no recorded height")
+                        })?);
+                    if deepest > limits.max_depth {
+                        return Err(limit("depth", limits.max_depth, deepest));
+                    }
+                    walk.maximum_depth = walk.maximum_depth.max(deepest);
                     continue;
                 }
                 if !visiting.insert(root.cid.clone()) {
@@ -242,13 +271,18 @@ where
                         depth,
                     },
                 );
-                stack.push(Frame::Exit(root.cid));
+                let children = references
+                    .iter()
+                    .map(|reference| reference.cid.clone())
+                    .collect();
+                stack.push(Frame::Exit(root.cid, children));
                 for reference in references.into_iter().rev() {
                     stack.push(Frame::Enter(reference, depth + 1));
                 }
             }
-            Frame::Exit(cid) => {
+            Frame::Exit(cid, children) => {
                 visiting.remove(&cid);
+                heights.insert(cid.clone(), subtree_height(&heights, &children)?);
                 if seen.insert(cid.clone()) {
                     let object = pending.remove(&cid).expect("entered content object");
                     walk.total_bytes = walk.total_bytes.saturating_add(object.bytes.len());
@@ -468,7 +502,19 @@ fn is_proximity_node_kind(kind: ContentObjectKind) -> bool {
 
 enum Frame {
     Enter(TypedContentRoot, usize),
-    Exit(Cid),
+    /// Leave an object; carries its direct reference CIDs for height tracking.
+    Exit(Cid, Vec<Cid>),
+}
+
+/// Height of an object whose direct references have all completed.
+fn subtree_height(heights: &HashMap<Cid, usize>, children: &[Cid]) -> Result<usize, Error> {
+    children.iter().try_fold(0usize, |height, child| {
+        let child_height = heights
+            .get(child)
+            .copied()
+            .ok_or_else(|| invalid("content reference completed without a recorded height"))?;
+        Ok(height.max(child_height.saturating_add(1)))
+    })
 }
 
 /// Persisted-format constraints on ordered nodes discovered during one walk.
@@ -561,6 +607,9 @@ fn references(
                     let cid = Cid(value
                         .try_into()
                         .map_err(|_| invalid("ordered internal value is not a CID"))?);
+                    // Structural children inherit the parent's format; only
+                    // leaf tree-reference edges may change format.
+                    formats.require(&cid, &node.format)?;
                     output.push(TypedContentRoot::new(ContentObjectKind::OrderedNode, cid));
                 }
             }

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use prolly::{
     walk_content_graph, Cid, Config, ContentGraphLimits, ContentObjectKind, Error,
-    LargeValueConfig, MemBlobStore, MemStore, Mutation, NodeLayoutSpec, Prolly, RuntimeConfig,
-    Store, Tree, TreeFormat, TreeRef, TypedContentRoot, ValueRef, ValueRefView,
+    LargeValueConfig, MemBlobStore, MemStore, Mutation, Node, NodeLayoutSpec, Prolly,
+    RuntimeConfig, Store, Tree, TreeFormat, TreeRef, TypedContentRoot, ValueRef, ValueRefView,
 };
 
 fn small_config() -> Config {
@@ -613,4 +613,173 @@ fn snapshots_include_and_verify_nested_closure() {
     });
     let forged = prolly::SnapshotBundle::new(mislabeled, nodes);
     assert!(matches!(forged.verify(), Err(Error::FormatMismatch { .. })));
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let waker = futures_util::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn typed_walk(
+    store: &Arc<MemStore>,
+    root: &Tree,
+    limits: &ContentGraphLimits,
+) -> [Result<prolly::ContentGraphWalk, Error>; 2] {
+    let roots = [TypedContentRoot::new(
+        ContentObjectKind::OrderedNode,
+        root.root.clone().unwrap(),
+    )];
+    [
+        walk_content_graph(&**store, &roots, limits),
+        block_on(prolly::walk_content_graph_async(
+            &prolly::SyncStoreAsAsync::new(store.clone()),
+            &roots,
+            limits,
+        )),
+    ]
+}
+
+#[test]
+fn partially_cached_frontiers_still_check_conflicting_formats() {
+    // FileNodeStore does not prefer batch reads, so a frontier with one
+    // uncached node takes the single-miss load path.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "prolly-tree-ref-cache-{}-{nanos}",
+        std::process::id()
+    ));
+    let store = Arc::new(prolly::FileNodeStore::open(&path).unwrap());
+    assert!(!store.prefers_batch_reads());
+    let writer = Prolly::new(store.clone(), small_config());
+    let plain_writer = Prolly::new(store.clone(), plain_config());
+    let cached = writer
+        .put(&writer.create(), b"c".to_vec(), b"c".to_vec())
+        .unwrap();
+    let uncached = plain_writer
+        .put(&plain_writer.create(), b"d".to_vec(), b"d".to_vec())
+        .unwrap();
+    let wrong = TreeRef::new(cached.root.clone(), plain_config().format).unwrap();
+    let parent = writer
+        .put(&writer.create(), b"a".to_vec(), tree_value(&cached))
+        .unwrap();
+    let parent = writer
+        .put(&parent, b"b".to_vec(), ValueRef::Tree(wrong).to_bytes())
+        .unwrap();
+    let parent = writer
+        .put(&parent, b"d".to_vec(), tree_value(&uncached))
+        .unwrap();
+
+    for _ in 0..3 {
+        let reader = Prolly::new(store.clone(), small_config());
+        assert!(matches!(
+            reader.mark_reachable(std::slice::from_ref(&parent)),
+            Err(Error::FormatMismatch { .. })
+        ));
+        let reader = Prolly::new(store.clone(), small_config());
+        assert!(reader
+            .mark_reachable_blobs(std::slice::from_ref(&parent))
+            .is_err());
+        let reader = Prolly::new(store.clone(), small_config());
+        assert!(reader.export_snapshot(&parent).is_err());
+    }
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn typed_walk_requires_structural_children_to_inherit_the_referenced_format() {
+    let store = Arc::new(MemStore::new());
+    let prolly = Prolly::new(store.clone(), small_config());
+    let plain = Prolly::new(store.clone(), plain_config());
+    let foreign_leaf = plain
+        .put(&plain.create(), b"x".to_vec(), b"x".to_vec())
+        .unwrap()
+        .root
+        .unwrap();
+
+    let multi_level = build_tree(&prolly, "internal", 30);
+    let root_cid = multi_level.root.clone().unwrap();
+    let mut internal = Node::from_bytes(&store.get(root_cid.as_bytes()).unwrap().unwrap()).unwrap();
+    assert!(!internal.leaf);
+    internal.vals[0] = foreign_leaf.as_bytes().to_vec();
+    let bytes = internal.to_bytes();
+    let forged_root = Cid::from_bytes(&bytes);
+    store.put(forged_root.as_bytes(), &bytes).unwrap();
+
+    let reference = TreeRef::new(Some(forged_root), small_config().format).unwrap();
+    let parent = prolly
+        .put(
+            &prolly.create(),
+            b"ref".to_vec(),
+            ValueRef::Tree(reference).to_bytes(),
+        )
+        .unwrap();
+    for result in typed_walk(&store, &parent, &ContentGraphLimits::default()) {
+        assert!(
+            result.is_err(),
+            "typed walk accepted a structural format change"
+        );
+    }
+    assert!(prolly
+        .mark_reachable(std::slice::from_ref(&parent))
+        .is_err());
+}
+
+#[test]
+fn typed_walk_depth_limits_cover_longer_paths_through_shared_objects() {
+    let store = Arc::new(MemStore::new());
+    let prolly = Prolly::new(store.clone(), Config::default());
+    let leaf_with = |entries: &[(&str, Vec<u8>)]| {
+        let mut tree = prolly.create();
+        for (key, value) in entries {
+            tree = prolly
+                .put(&tree, key.as_bytes().to_vec(), value.clone())
+                .unwrap();
+        }
+        tree
+    };
+    let shallow = ContentGraphLimits {
+        max_depth: 2,
+        ..ContentGraphLimits::default()
+    };
+
+    // Vary content so CID ordering visits the short path first in some cases.
+    for variant in 0..12u8 {
+        // An already-seen object reached beyond the limit: R -> T, R -> A -> B -> T.
+        let target = leaf_with(&[("t", vec![variant])]);
+        let b = leaf_with(&[("b", tree_value(&target))]);
+        let a = leaf_with(&[("a", tree_value(&b))]);
+        let root = leaf_with(&[("a", tree_value(&a)), ("t", tree_value(&target))]);
+        for result in typed_walk(&store, &root, &shallow) {
+            assert!(
+                matches!(result, Err(Error::ContentGraphResourceLimitExceeded { .. })),
+                "variant {variant}: over-limit shared target accepted"
+            );
+        }
+        for result in typed_walk(&store, &root, &ContentGraphLimits::default()) {
+            assert_eq!(result.unwrap().maximum_depth, 3, "variant {variant}");
+        }
+
+        // An object within the limit whose seen descendant exceeds it:
+        // R -> X -> Y, R -> A -> X -> Y.
+        let y = leaf_with(&[("y", vec![variant])]);
+        let x = leaf_with(&[("x", tree_value(&y))]);
+        let a = leaf_with(&[("ax", tree_value(&x))]);
+        let root = leaf_with(&[("a", tree_value(&a)), ("x", tree_value(&x))]);
+        for result in typed_walk(&store, &root, &shallow) {
+            assert!(
+                matches!(result, Err(Error::ContentGraphResourceLimitExceeded { .. })),
+                "variant {variant}: over-limit shared descendant accepted"
+            );
+        }
+    }
 }

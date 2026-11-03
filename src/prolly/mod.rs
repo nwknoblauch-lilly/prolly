@@ -7372,55 +7372,52 @@ where
                 for idx in positions {
                     nodes[idx] = Some(node.clone());
                 }
+                // Fall through so previously cached entries are validated
+                // against the requested format too.
+            } else {
+                let keys = missing_cids
+                    .iter()
+                    .map(|cid| cid.as_bytes())
+                    .collect::<Vec<_>>();
+                self.metrics.add_cache_misses(keys.len());
+                let loaded = self
+                    .store
+                    .batch_get_ordered_unique(&keys)
+                    .await
+                    .map_err(|e| Error::Store(Box::new(e)))?;
+                if loaded.len() != missing_cids.len() {
+                    return Err(Error::InvalidNode);
+                }
+                let (loaded_nodes, loaded_bytes) = loaded_node_totals(&loaded);
+                self.metrics
+                    .record_batch_read(keys.len(), loaded_bytes, loaded_nodes);
 
-                return nodes
+                let decoded = missing_cids
                     .into_iter()
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or(Error::InvalidNode);
-            }
+                    .zip(loaded)
+                    .map(|(cid, bytes)| {
+                        let bytes = bytes.ok_or_else(|| Error::NotFound(cid.clone()))?;
+                        let node = Arc::new(engine::validation::decode_owned(
+                            &cid,
+                            expected_format,
+                            &bytes,
+                        )?);
+                        Ok((cid, node))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
 
-            let keys = missing_cids
-                .iter()
-                .map(|cid| cid.as_bytes())
-                .collect::<Vec<_>>();
-            self.metrics.add_cache_misses(keys.len());
-            let loaded = self
-                .store
-                .batch_get_ordered_unique(&keys)
-                .await
-                .map_err(|e| Error::Store(Box::new(e)))?;
-            if loaded.len() != missing_cids.len() {
-                return Err(Error::InvalidNode);
-            }
-            let (loaded_nodes, loaded_bytes) = loaded_node_totals(&loaded);
-            self.metrics
-                .record_batch_read(keys.len(), loaded_bytes, loaded_nodes);
-
-            let decoded = missing_cids
-                .into_iter()
-                .zip(loaded)
-                .map(|(cid, bytes)| {
-                    let bytes = bytes.ok_or_else(|| Error::NotFound(cid.clone()))?;
-                    let node = Arc::new(engine::validation::decode_owned(
-                        &cid,
-                        expected_format,
-                        &bytes,
-                    )?);
-                    Ok((cid, node))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-
-            let mut cache = self.node_cache.write().ok();
-            let mut evictions = 0usize;
-            for ((cid, node), positions) in decoded.into_iter().zip(missing_positions) {
-                if let Some(cache) = cache.as_mut() {
-                    evictions += cache.insert(cid, node.clone(), node.encoded_len());
+                let mut cache = self.node_cache.write().ok();
+                let mut evictions = 0usize;
+                for ((cid, node), positions) in decoded.into_iter().zip(missing_positions) {
+                    if let Some(cache) = cache.as_mut() {
+                        evictions += cache.insert(cid, node.clone(), node.encoded_len());
+                    }
+                    for idx in positions {
+                        nodes[idx] = Some(node.clone());
+                    }
                 }
-                for idx in positions {
-                    nodes[idx] = Some(node.clone());
-                }
+                self.metrics.add_cache_evictions(evictions);
             }
-            self.metrics.add_cache_evictions(evictions);
         }
 
         let nodes = nodes

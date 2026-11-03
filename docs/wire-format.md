@@ -14,6 +14,13 @@ conformance fixtures are generated from Rust.
 
 ## Node Format: `CRAB` Version 1
 
+> **Out of date.** The current writer emits `CRAB` version `2`
+> (`COMPACT_VERSION` in `src/prolly/node.rs`), and the version-2 layout is not
+> described here. Treat the generated node fixtures in
+> `conformance/prolly-fixtures.v1.json` and the Rust implementation as the
+> source of truth for node bytes. Tree-valued references do not change the
+> node format.
+
 New nodes are encoded in a deterministic compact binary format:
 
 1. magic bytes: ASCII `CRAB`
