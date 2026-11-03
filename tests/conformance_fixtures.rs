@@ -35,6 +35,25 @@ fn checked_in_conformance_fixtures_are_decodable() {
         assert_eq!(hex(&value.to_bytes()), fixture["bytes"].as_str().unwrap());
     }
 
+    for fixture in fixtures["tree_ref_fixtures"].as_array().unwrap() {
+        let bytes = from_hex(fixture["bytes"].as_str().unwrap());
+        let ValueRef::Tree(reference) = ValueRef::from_bytes(&bytes).unwrap() else {
+            panic!("tree_ref_fixtures entry is not a tree reference");
+        };
+        assert_eq!(
+            reference.root().map(|cid| hex(cid.as_bytes())),
+            fixture["root"].as_str().map(str::to_owned)
+        );
+        assert_eq!(
+            hex(&reference.format().canonical_bytes().unwrap()),
+            fixture["format"].as_str().unwrap()
+        );
+        assert_eq!(
+            hex(&ValueRef::Tree(reference).to_bytes()),
+            fixture["bytes"].as_str().unwrap()
+        );
+    }
+
     for fixture in fixtures["manifest_fixtures"].as_array().unwrap() {
         let bytes = from_hex(fixture["bytes"].as_str().unwrap());
         let manifest = RootManifest::from_bytes(&bytes).unwrap();

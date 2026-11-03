@@ -1287,7 +1287,7 @@ let old = prolly
     .unwrap();
 let old_ref = match prolly.get_value_ref(&old, b"doc/body").unwrap().unwrap() {
     ValueRef::Blob(reference) => reference,
-    ValueRef::Inline(_) => unreachable!("payload is larger than the threshold"),
+    ValueRef::Inline(_) | ValueRef::Tree(_) => unreachable!("payload is larger than the threshold"),
 };
 
 let current = prolly
@@ -1295,7 +1295,7 @@ let current = prolly
     .unwrap();
 let current_ref = match prolly.get_value_ref(&current, b"doc/body").unwrap().unwrap() {
     ValueRef::Blob(reference) => reference,
-    ValueRef::Inline(_) => unreachable!("payload is larger than the threshold"),
+    ValueRef::Inline(_) | ValueRef::Tree(_) => unreachable!("payload is larger than the threshold"),
 };
 
 let candidates = vec![old_ref, current_ref];
@@ -1303,6 +1303,63 @@ let plan = prolly.plan_blob_gc(&blobs, &[current.clone()], &candidates).unwrap()
 let sweep = prolly.sweep_blob_gc(&blobs, &[current], &candidates).unwrap();
 assert_eq!(sweep.deleted_blobs, plan.reclaimable_blob_count);
 ```
+
+## Tree-Valued References
+
+A leaf value can refer to another immutable ordered tree with
+`ValueRef::Tree(TreeRef)`. A `TreeRef` records the child's optional root CID and
+its persisted `TreeFormat`; runtime cache settings are not part of its bytes,
+equality, or hash. Empty trees are referenced with no root.
+
+```rust
+use prolly::{Config, MemStore, Prolly, RuntimeConfig, TreeRef, ValueRef};
+use std::sync::Arc;
+
+let prolly = Prolly::new(Arc::new(MemStore::new()), Config::default());
+let child = prolly
+    .put(&prolly.create(), b"file".to_vec(), b"contents".to_vec())
+    .unwrap();
+let parent = prolly
+    .put(
+        &prolly.create(),
+        b"dir".to_vec(),
+        ValueRef::Tree(TreeRef::try_from(&child).unwrap()).to_bytes(),
+    )
+    .unwrap();
+
+let destination = Arc::new(MemStore::new());
+prolly.copy_missing_nodes(&parent, &destination).unwrap();
+let reader = Prolly::new(destination, Config::default());
+let Some(ValueRef::Tree(found)) = reader.get_value_ref(&parent, b"dir").unwrap() else {
+    panic!("expected a tree reference");
+};
+let child_tree = found.to_tree(RuntimeConfig::default());
+assert_eq!(reader.get(&child_tree, b"file").unwrap(), Some(b"contents".to_vec()));
+```
+
+Closure operations follow these references: `mark_reachable`, node GC,
+`plan_missing_nodes`/`copy_missing_nodes`, `export_snapshot`,
+`SnapshotBundle::verify`, `import_snapshot`, `mark_reachable_blobs`, and the
+typed content-graph walkers. Each reference is checked against its declared
+format, and a missing target, format mismatch, or malformed `PLVB` envelope
+fails the operation instead of producing a partial closure or GC plan. As a
+result, `VersionedMap::verify_catalog` reachable node and byte counts include
+referenced child trees.
+
+Ordinary reads stay byte-oriented. `get`, ranges, flat diff and merge, `len`,
+`rank`, and `select` treat the reference as one opaque value and never open the
+child. `get_large_value` returns an `Error::Deserialize` for a tree reference.
+Only the outer envelope is interpreted: `ValueRef::Inline` payloads, blob
+bytes, keys, and JSON or CBOR payloads are never searched for references, so
+store application bytes that begin with `PLVB` through `put_large_value` or an
+explicit `ValueRef::Inline` escape. Node-only APIs copy nodes, not blob-store
+payloads.
+
+Upgrade every process that runs GC or closure verification before writing tree
+references to shared stores. Older `ValueRef` decoders reject tag 2, but older
+node GC does not inspect leaf values and would treat referenced child trees as
+unreachable. Language bindings do not expose tree references yet; their typed
+value-reference APIs return an unsupported-kind error for them.
 
 ## Garbage Collection
 
@@ -1338,7 +1395,8 @@ let sweep = prolly.sweep_gc(&[updated], &candidates).unwrap();
 assert_eq!(sweep.deleted_nodes, plan.reclaimable_nodes);
 ```
 
-`mark_reachable` deduplicates shared subtrees across roots. `plan_gc` is a
+`mark_reachable` deduplicates shared subtrees across roots and follows
+tree-valued references into child trees. `plan_gc` is a
 dry-run: it reports unreachable candidate CIDs that are present in the store,
 their reclaimable byte count, and candidate CIDs that were already missing.
 `sweep_gc` deletes exactly the reclaimable candidates from the plan and clears

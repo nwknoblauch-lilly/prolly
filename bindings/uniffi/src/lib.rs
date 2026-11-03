@@ -2709,8 +2709,9 @@ impl ProllyEngine {
         with_engine!(self, engine, {
             engine
                 .get_value_ref(&tree, &key)
-                .map(|value_ref| value_ref.map(ValueRefRecord::from))
-                .map_err(Into::into)
+                .map_err(ProllyBindingError::from)?
+                .map(ValueRefRecord::try_from)
+                .transpose()
         })
     }
 
@@ -5371,16 +5372,12 @@ pub fn value_ref_to_bytes(record: ValueRefRecord) -> Result<Vec<u8>, ProllyBindi
 
 #[uniffi::export]
 pub fn value_ref_from_bytes(bytes: Vec<u8>) -> Result<ValueRefRecord, ProllyBindingError> {
-    ValueRef::from_bytes(&bytes)
-        .map(ValueRefRecord::from)
-        .map_err(Into::into)
+    ValueRefRecord::try_from(ValueRef::from_bytes(&bytes)?)
 }
 
 #[uniffi::export]
 pub fn value_ref_from_stored_bytes(bytes: Vec<u8>) -> Result<ValueRefRecord, ProllyBindingError> {
-    ValueRef::from_stored_bytes(&bytes)
-        .map(ValueRefRecord::from)
-        .map_err(Into::into)
+    ValueRefRecord::try_from(ValueRef::from_stored_bytes(&bytes)?)
 }
 
 #[uniffi::export]
@@ -7052,19 +7049,27 @@ impl TryFrom<LargeValueConfigRecord> for LargeValueConfig {
     }
 }
 
-impl From<ValueRef> for ValueRefRecord {
-    fn from(value: ValueRef) -> Self {
+/// Foreign value-reference records represent only Inline and Blob. Tree
+/// references have no foreign record yet, so conversion fails explicitly
+/// instead of substituting another kind or materializing the child tree.
+impl TryFrom<ValueRef> for ValueRefRecord {
+    type Error = ProllyBindingError;
+
+    fn try_from(value: ValueRef) -> Result<Self, ProllyBindingError> {
         match value {
-            ValueRef::Inline(value) => Self {
+            ValueRef::Inline(value) => Ok(Self {
                 kind: ValueRefKind::Inline,
                 value: Some(value),
                 blob: None,
-            },
-            ValueRef::Blob(blob) => Self {
+            }),
+            ValueRef::Blob(blob) => Ok(Self {
                 kind: ValueRefKind::Blob,
                 value: None,
                 blob: Some(blob.into()),
-            },
+            }),
+            ValueRef::Tree(_) => Err(ProllyBindingError::Serialization {
+                reason: "unsupported value reference kind: tree references are not supported by this binding".to_string(),
+            }),
         }
     }
 }
@@ -9950,6 +9955,33 @@ mod tests {
         let stored_ref = value_ref_from_stored_bytes(stored_ref_bytes.clone()).unwrap();
         assert_eq!(stored_ref.kind, ValueRefKind::Blob);
         assert!(value_ref_inline_requires_escape(stored_ref_bytes));
+
+        let tree_ref_bytes =
+            ValueRef::Tree(prolly::TreeRef::new(None, prolly::TreeFormat::default()).unwrap())
+                .to_bytes();
+        let unsupported = |result: Result<ValueRefRecord, ProllyBindingError>| {
+            matches!(
+                result,
+                Err(ProllyBindingError::Serialization { ref reason })
+                    if reason.contains("unsupported value reference kind")
+            )
+        };
+        assert!(unsupported(value_ref_from_bytes(tree_ref_bytes.clone())));
+        assert!(unsupported(value_ref_from_stored_bytes(
+            tree_ref_bytes.clone()
+        )));
+        let with_tree_ref = engine
+            .put(tree.clone(), b"tree".to_vec(), tree_ref_bytes.clone())
+            .unwrap();
+        assert_eq!(
+            engine.get(with_tree_ref.clone(), b"tree".to_vec()).unwrap(),
+            Some(tree_ref_bytes)
+        );
+        assert!(unsupported(
+            engine
+                .get_value_ref(with_tree_ref, b"tree".to_vec())
+                .map(|record| record.expect("stored value"))
+        ));
         assert_eq!(
             engine
                 .get_large_value(blob_store.clone(), tree.clone(), b"big".to_vec())

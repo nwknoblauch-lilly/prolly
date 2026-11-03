@@ -326,14 +326,20 @@ Large value offload stores either inline bytes or a reference:
 ```text
 ValueRef::Inline(bytes)
 ValueRef::Blob(BlobRef)
+ValueRef::Tree(TreeRef)
 ```
+
+`ValueRef::Tree` refers to another immutable ordered tree by optional root CID
+and persisted `TreeFormat`. Reachability, GC, node copy, and snapshot export and
+verification follow it; raw reads, flat diff and merge, and cardinality treat
+it as one opaque value.
 
 A blob reference should contain enough information to retrieve and validate the
 payload. Blob bytes may live in a different store from tree nodes.
 
 The tree remains the source of truth for which blobs are reachable from a
-snapshot. Blob GC must trace retained tree roots and sweep only unreachable
-blob references.
+snapshot. Blob GC must trace retained tree roots, including referenced child
+trees, and sweep only unreachable blob references.
 
 ## GC Contract
 

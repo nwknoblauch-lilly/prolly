@@ -1,11 +1,13 @@
 //! Store-to-store synchronization helpers for content-addressed tree nodes.
 
+use super::blob::{stored_value_edge, StoredValueEdge};
 use super::cid::Cid;
 use super::error::Error;
+use super::format::TreeFormat;
 use super::node::Node;
 use super::tree::Tree;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 /// Current in-memory format version for portable tree snapshot bundles.
 pub const SNAPSHOT_BUNDLE_FORMAT_VERSION: u32 = 1;
@@ -198,8 +200,10 @@ impl SnapshotBundle {
     ///
     /// This check is read-only: it validates version, canonicalizes nodes,
     /// verifies every node byte payload by CID, decodes reachable nodes from
-    /// the supplied bytes, and compares the reachable CID set with the bundled
-    /// CID set.
+    /// the supplied bytes under their expected tree format, follows tree
+    /// references in leaf values, and compares the reachable CID set with the
+    /// bundled CID set. A node whose format does not match the format declared
+    /// for it is an error.
     pub fn verify(&self) -> Result<SnapshotBundleVerification, Error> {
         self.validate_format_version()?;
         let nodes = canonical_snapshot_nodes(&self.nodes)?;
@@ -335,53 +339,61 @@ fn reachable_snapshot_nodes(
     tree: &Tree,
     nodes_by_cid: &BTreeMap<Vec<u8>, &[u8]>,
 ) -> Result<SnapshotBundleReachability, Error> {
-    let mut seen = BTreeMap::<Vec<u8>, ()>::new();
-    let mut missing = BTreeMap::<Vec<u8>, ()>::new();
-    let mut frontier = VecDeque::new();
+    // Each `(cid, format)` requirement is visited once. Internal children
+    // inherit their parent's format; tree-reference edges declare their own.
+    // A node reached under a format it does not carry fails verification.
+    let mut paths = HashSet::<(Vec<u8>, Cid)>::new();
+    let mut reachable = BTreeSet::<Vec<u8>>::new();
+    let mut frontier = VecDeque::<(Vec<u8>, TreeFormat)>::new();
     let mut reachable_bytes = 0usize;
 
     if let Some(root) = &tree.root {
-        frontier.push_back(root.as_bytes().to_vec());
+        paths.insert((root.as_bytes().to_vec(), tree.config.format.digest()?));
+        frontier.push_back((root.as_bytes().to_vec(), tree.config.format.clone()));
     }
 
-    while let Some(cid) = frontier.pop_front() {
-        if seen.contains_key(&cid) {
-            continue;
-        }
-        seen.insert(cid.clone(), ());
-
+    while let Some((cid, format)) = frontier.pop_front() {
+        let first_visit = reachable.insert(cid.clone());
         let Some(bytes) = nodes_by_cid.get(&cid) else {
-            missing.insert(cid, ());
             continue;
         };
 
-        let node = Node::from_bytes(bytes)?;
+        let node = Node::from_bytes_with_format(bytes, &format)?;
         if node.keys.len() != node.vals.len() {
             return Err(Error::InvalidNode);
         }
-        reachable_bytes += bytes.len();
+        if first_visit {
+            reachable_bytes += bytes.len();
+        }
 
-        if !node.leaf {
+        if node.leaf {
+            for value in &node.vals {
+                if let StoredValueEdge::Tree(reference) = stored_value_edge(value)? {
+                    let Some(root) = reference.root() else {
+                        continue;
+                    };
+                    let path = (root.as_bytes().to_vec(), reference.format().digest()?);
+                    if paths.insert(path) {
+                        frontier.push_back((root.as_bytes().to_vec(), reference.format().clone()));
+                    }
+                }
+            }
+        } else {
+            let digest = format.digest()?;
             for child in &node.vals {
                 let cid = child
                     .as_slice()
                     .try_into()
                     .map(Cid)
                     .map_err(|_| Error::InvalidNode)?;
-                if !seen.contains_key(cid.as_bytes()) {
-                    frontier.push_back(cid.as_bytes().to_vec());
+                if paths.insert((cid.as_bytes().to_vec(), digest.clone())) {
+                    frontier.push_back((cid.as_bytes().to_vec(), format.clone()));
                 }
             }
         }
     }
 
-    let mut reachable_cids = seen.into_keys().collect::<Vec<_>>();
-    for cid in missing.into_keys() {
-        if !reachable_cids.contains(&cid) {
-            reachable_cids.push(cid);
-        }
-    }
-    reachable_cids.sort();
+    let reachable_cids = reachable.into_iter().collect::<Vec<_>>();
 
     Ok(SnapshotBundleReachability {
         reachable_cids,

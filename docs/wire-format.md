@@ -95,9 +95,21 @@ Ports must match the Rust xxHash64 result exactly for writer compatibility.
 
 - magic `PLVB`
 - one-byte version `1`
-- one-byte kind: `0` inline, `1` blob
+- one-byte kind: `0` inline, `1` blob, `2` tree
 - inline: big-endian `u64` length plus value bytes
 - blob: 32-byte blob CID plus big-endian `u64` blob length
+- tree: one-byte root flag (`0` empty, `1` present), the 32-byte root CID when
+  present, big-endian `u64` format length, then exactly that many bytes of
+  `TreeFormat::canonical_bytes()`. Empty references still carry the format.
+  Runtime configuration is never encoded. Decoders reject invalid root flags,
+  truncation, length mismatches, trailing bytes, and format bytes that do not
+  re-encode identically.
+
+Closure operations (reachability, GC, node copy, snapshot export and
+verification) follow tree envelopes under their declared format. Decoders that
+predate tag `2` reject it, but older node GC ignores leaf values; upgrade every
+GC and closure-verification process before storing tree references in shared
+data.
 
 Non-`PLVB` stored values are interpreted as inline bytes by large-value helpers.
 

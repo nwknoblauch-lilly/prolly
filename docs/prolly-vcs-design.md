@@ -289,21 +289,18 @@ not include the display prefix.
 
 ### Tree References
 
-A commit must store the complete prolly tree handle, not only the root CID,
-because the tree config is needed to interpret nodes.
+A commit must store the root CID together with the persisted tree format,
+because the format is needed to interpret nodes. Reuse the core
+`prolly::TreeRef` (also used by `ValueRef::Tree`) rather than defining another
+type. It holds an optional root CID and the persisted `TreeFormat`, excludes
+runtime configuration from its identity, and validates the format on
+construction.
 
 ```rust
-pub struct TreeRef {
-    pub root: Option<prolly::Cid>,
-    pub config: prolly::Config,
-}
-```
+pub use prolly::TreeRef;
 
-Conversions:
-
-```rust
-impl From<&prolly::Tree> for TreeRef;
-impl TryFrom<TreeRef> for prolly::Tree;
+impl TryFrom<&prolly::Tree> for TreeRef;      // copies root and persisted format
+TreeRef::to_tree(&self, runtime: prolly::RuntimeConfig) -> prolly::Tree;
 ```
 
 ### Commit Object

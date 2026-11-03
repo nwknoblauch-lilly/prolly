@@ -1,6 +1,8 @@
 use super::kind::{ContentObjectKind, TypedContentObject, TypedContentRoot};
+use crate::prolly::blob::{stored_value_edge, StoredValueEdge};
 use crate::prolly::cid::Cid;
 use crate::prolly::error::Error;
+use crate::prolly::format::TreeFormat;
 use crate::prolly::node::Node;
 use crate::prolly::proximity::accelerator::catalog::{
     CatalogAcceleratorKind, Manifest as CatalogManifest,
@@ -66,6 +68,7 @@ pub fn walk_content_graph<S: Store>(
     let mut seen = HashSet::<Cid>::new();
     let mut contexts = HashMap::<Cid, (ContentObjectKind, Option<u32>)>::new();
     let mut pending = HashMap::<Cid, TypedContentObject>::new();
+    let mut formats = OrderedFormats::default();
     let mut walk = ContentGraphWalk::default();
     let mut loaded_bytes = 0usize;
 
@@ -99,7 +102,7 @@ pub fn walk_content_graph<S: Store>(
                     return Err(limit("bytes", limits.max_bytes, next_bytes));
                 }
                 loaded_bytes = next_bytes;
-                let (actual_kind, mut references) = references(&root, &bytes)?;
+                let (actual_kind, mut references) = references(&root, &bytes, &mut formats)?;
                 if references.len() > limits.max_references_per_object {
                     return Err(limit(
                         "references",
@@ -162,6 +165,7 @@ where
     let mut seen = HashSet::<Cid>::new();
     let mut contexts = HashMap::<Cid, (ContentObjectKind, Option<u32>)>::new();
     let mut pending = HashMap::<Cid, TypedContentObject>::new();
+    let mut formats = OrderedFormats::default();
     let mut prefetched = HashMap::<Cid, Vec<u8>>::new();
     let mut walk = ContentGraphWalk::default();
     let mut loaded_bytes = 0usize;
@@ -204,7 +208,7 @@ where
                     return Err(limit("bytes", limits.max_bytes, reserved_bytes));
                 }
                 loaded_bytes = next_bytes;
-                let (actual_kind, mut references) = references(&root, &bytes)?;
+                let (actual_kind, mut references) = references(&root, &bytes, &mut formats)?;
                 if references.len() > limits.max_references_per_object {
                     return Err(limit(
                         "references",
@@ -428,7 +432,7 @@ pub fn content_references<S: Store>(
     root: &TypedContentRoot,
 ) -> Result<Vec<TypedContentRoot>, Error> {
     let bytes = load_content(store, &root.cid)?;
-    let (_, mut output) = references(root, &bytes)?;
+    let (_, mut output) = references(root, &bytes, &mut OrderedFormats::default())?;
     output.sort_by(compare_root);
     output.dedup();
     Ok(output)
@@ -443,7 +447,7 @@ where
     S::Error: Send + Sync,
 {
     let bytes = load_content_async(store, &root.cid).await?;
-    let (_, mut output) = references(root, &bytes)?;
+    let (_, mut output) = references(root, &bytes, &mut OrderedFormats::default())?;
     output.sort_by(compare_root);
     output.dedup();
     Ok(output)
@@ -467,9 +471,71 @@ enum Frame {
     Exit(Cid),
 }
 
+/// Persisted-format constraints on ordered nodes discovered during one walk.
+///
+/// Tree-reference edges declare the format their target root must have. The
+/// typed root carries no format, so the walker tracks declarations and the
+/// observed format of every loaded ordered node here and rejects a mismatch
+/// regardless of which is seen first.
+#[derive(Default)]
+struct OrderedFormats {
+    distinct: Vec<TreeFormat>,
+    observed: HashMap<Cid, usize>,
+    required: HashMap<Cid, usize>,
+}
+
+impl OrderedFormats {
+    fn intern(&mut self, format: &TreeFormat) -> usize {
+        match self.distinct.iter().position(|known| known == format) {
+            Some(index) => index,
+            None => {
+                self.distinct.push(format.clone());
+                self.distinct.len() - 1
+            }
+        }
+    }
+
+    fn observe(&mut self, cid: &Cid, format: &TreeFormat) -> Result<(), Error> {
+        let index = self.intern(format);
+        if self
+            .required
+            .get(cid)
+            .is_some_and(|required| *required != index)
+        {
+            return Err(tree_format_mismatch());
+        }
+        self.observed.insert(cid.clone(), index);
+        Ok(())
+    }
+
+    fn require(&mut self, cid: &Cid, format: &TreeFormat) -> Result<(), Error> {
+        let index = self.intern(format);
+        if self
+            .observed
+            .get(cid)
+            .is_some_and(|observed| *observed != index)
+        {
+            return Err(tree_format_mismatch());
+        }
+        match self.required.get(cid) {
+            Some(required) if *required != index => Err(tree_format_mismatch()),
+            Some(_) => Ok(()),
+            None => {
+                self.required.insert(cid.clone(), index);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn tree_format_mismatch() -> Error {
+    invalid("tree reference format does not match the referenced ordered node")
+}
+
 fn references(
     root: &TypedContentRoot,
     bytes: &[u8],
+    formats: &mut OrderedFormats,
 ) -> Result<(ContentObjectKind, Vec<TypedContentRoot>), Error> {
     validate_root_context(root)?;
     let mut output = Vec::new();
@@ -479,7 +545,18 @@ fn references(
             if node.keys.len() != node.vals.len() {
                 return Err(invalid("ordered node key/value count mismatch"));
             }
-            if !node.leaf {
+            formats.observe(&root.cid, &node.format)?;
+            if node.leaf {
+                for value in &node.vals {
+                    if let StoredValueEdge::Tree(reference) = stored_value_edge(value)? {
+                        let Some(cid) = reference.root().cloned() else {
+                            continue;
+                        };
+                        formats.require(&cid, reference.format())?;
+                        output.push(TypedContentRoot::new(ContentObjectKind::OrderedNode, cid));
+                    }
+                }
+            } else {
                 for value in node.vals {
                     let cid = Cid(value
                         .try_into()

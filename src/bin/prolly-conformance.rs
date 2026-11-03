@@ -7,7 +7,7 @@ use prolly::{
     debug_key, decode_segments, encode_segment, i128_key, i64_key, physical_index_key, prefix_end,
     timestamp_millis_key, u128_key, u64_key, BlobRef, Cid, Config, Diff, Encoding, IndexProjection,
     MemStore, Node, NodeStoreScan, Prolly, RootManifest, SecondaryIndex, SecondaryIndexEntry,
-    SecondaryIndexRegistry, Store, ValueRef, VersionedValue,
+    SecondaryIndexRegistry, Store, TreeFormat, TreeRef, ValueRef, VersionedValue,
 };
 use serde::Serialize;
 
@@ -23,6 +23,9 @@ struct FixtureDocument {
     diff_fixtures: Vec<DiffFixture>,
     value_fixtures: Vec<ValueFixture>,
     blob_fixtures: Vec<BlobFixture>,
+    /// Tag-2 tree-reference envelopes. Kept separate from `blob_fixtures`,
+    /// which bindings without tree-reference support still decode.
+    tree_ref_fixtures: Vec<TreeRefFixture>,
     manifest_fixtures: Vec<ManifestFixture>,
     secondary_index_fixture: SecondaryIndexFixture,
 }
@@ -177,6 +180,14 @@ struct BlobFixture {
 }
 
 #[derive(Serialize)]
+struct TreeRefFixture {
+    name: &'static str,
+    root: Option<String>,
+    format: String,
+    bytes: String,
+}
+
+#[derive(Serialize)]
 struct ManifestFixture {
     name: &'static str,
     root: Option<String>,
@@ -240,6 +251,7 @@ fn fixture_document() -> Result<FixtureDocument, Box<dyn std::error::Error>> {
         diff_fixtures: vec![diff_fixture()?],
         value_fixtures: value_fixtures()?,
         blob_fixtures: blob_fixtures(),
+        tree_ref_fixtures: tree_ref_fixtures()?,
         manifest_fixtures: vec![manifest_fixture()?],
         secondary_index_fixture: secondary_index_fixture()?,
     })
@@ -625,6 +637,29 @@ fn blob_fixtures() -> Vec<BlobFixture> {
             bytes: hex(&blob.to_bytes()),
         },
     ]
+}
+
+fn tree_ref_fixtures() -> Result<Vec<TreeRefFixture>, Box<dyn std::error::Error>> {
+    let root = Cid::from_bytes(b"conformance-child-tree-root");
+    let port_format = port_config().format;
+    let cases = [
+        ("empty_default", None, TreeFormat::default()),
+        ("rooted_default", Some(root.clone()), TreeFormat::default()),
+        ("rooted_port_format", Some(root), port_format),
+    ];
+    cases
+        .into_iter()
+        .map(|(name, root, format)| {
+            let format_bytes = format.canonical_bytes()?;
+            let reference = TreeRef::new(root.clone(), format)?;
+            Ok(TreeRefFixture {
+                name,
+                root: root.map(|cid| hex(cid.as_bytes())),
+                format: hex(&format_bytes),
+                bytes: hex(&ValueRef::Tree(reference).to_bytes()),
+            })
+        })
+        .collect()
 }
 
 fn manifest_fixture() -> Result<ManifestFixture, Box<dyn std::error::Error>> {

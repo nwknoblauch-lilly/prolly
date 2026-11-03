@@ -1703,6 +1703,9 @@ impl<S: Store> Prolly<S> {
     }
 
     /// Get a value by key, resolving offloaded blob references when present.
+    ///
+    /// Tree references cannot be resolved as bytes and return
+    /// [`Error::Deserialize`]; use [`Self::get_value_ref`] to inspect them.
     pub fn get_large_value<B>(
         &self,
         blob_store: &B,
@@ -2563,6 +2566,11 @@ impl<S: Store> Prolly<S> {
     /// ignored, duplicate roots and shared subtrees are counted once, and the
     /// returned CID list is sorted for deterministic planning.
     ///
+    /// Leaf values holding a [`tree::TreeRef`] envelope are followed into the
+    /// referenced tree under its declared format, so the result includes
+    /// every nested tree's nodes. Missing targets, format mismatches, and
+    /// malformed `PLVB` envelopes fail the operation.
+    ///
     /// # Example
     /// ```
     /// use prolly::{Config, MemStore, Prolly};
@@ -2712,7 +2720,10 @@ impl<S: Store> Prolly<S> {
     ///
     /// The destination receives only immutable content-addressed node bytes it
     /// does not already have. Source and destination bytes are verified by CID
-    /// before the copy succeeds.
+    /// before the copy succeeds. The required set includes the nodes of every
+    /// tree referenced through a [`tree::TreeRef`] leaf value, so a destination
+    /// that already holds the parent root is still repaired. Only node bytes
+    /// are copied; blobs referenced by those trees stay in their blob store.
     ///
     /// # Example
     /// ```
@@ -2754,7 +2765,8 @@ impl<S: Store> Prolly<S> {
     /// makes the returned `bundle.tree` readable by a manager using that store.
     /// Node entries are sorted by raw CID bytes for deterministic transport and
     /// each node byte payload is verified against its CID before the export
-    /// succeeds.
+    /// succeeds. Trees referenced through [`tree::TreeRef`] leaf values are
+    /// exported with their nodes; offloaded blob bytes are not included.
     pub fn export_snapshot(&self, tree: &Tree) -> Result<SnapshotBundle, Error> {
         let ready_store = self.engine.store.clone();
         let future = self.engine.export_snapshot(tree);
@@ -2821,9 +2833,10 @@ impl<S: Store> Prolly<S> {
     /// Mark all offloaded blobs reachable from retained tree roots.
     ///
     /// This scans reachable leaf values for [`blob::ValueRef::Blob`] envelopes.
-    /// Ordinary raw values and escaped inline values are ignored. Empty roots,
-    /// duplicate roots, shared subtrees, and duplicate blob references are
-    /// counted once where appropriate.
+    /// Ordinary raw values and escaped inline values are ignored; tree
+    /// references are followed so blobs in nested trees are retained. Empty
+    /// roots, duplicate roots, shared subtrees, and duplicate blob references
+    /// are counted once where appropriate.
     pub fn mark_reachable_blobs(&self, roots: &[Tree]) -> Result<BlobGcReachability, Error> {
         let ready_store = self.engine.store.clone();
         let future = self.engine.mark_reachable_blobs(roots);
@@ -5517,7 +5530,9 @@ where
                     }
                     live_cids.push(cid.clone());
                 }
-                if !node.leaf {
+                if node.leaf {
+                    push_leaf_tree_edges(&node, &mut seen_paths, &mut frontier, limits.max_nodes)?;
+                } else {
                     let format_digest = expected_format.digest()?;
                     frontier.reserve(node.vals.len());
                     for idx in 0..node.len() {
@@ -5640,24 +5655,77 @@ where
         let Some(root) = tree.root.clone() else {
             return Ok(SnapshotBundle::new(tree.clone(), Vec::new()));
         };
-        let mut seen = HashSet::new();
-        seen.insert(root.clone());
-        let mut frontier = std::collections::VecDeque::from([root]);
+        // Frontier entries carry the format each node must have: internal
+        // children inherit it, tree-reference edges declare their own. Each
+        // `(cid, format)` requirement is loaded once; each CID is exported once.
+        let mut paths = HashSet::new();
+        paths.insert((root.clone(), tree.config.format.digest()?));
+        let mut unique = HashSet::new();
+        unique.insert(root.clone());
+        let mut exported = HashSet::new();
+        let mut frontier = std::collections::VecDeque::from([(root, tree.config.format.clone())]);
         let mut nodes = Vec::new();
         let mut byte_count = 0usize;
 
-        while !frontier.is_empty() {
-            let batch_len = frontier.len().min(ASYNC_NODE_PREFETCH_BATCH_SIZE);
-            let current = (0..batch_len)
-                .map(|_| frontier.pop_front().expect("bounded nonempty frontier"))
-                .collect::<Vec<_>>();
+        while let Some((_, batch_format)) = frontier.front() {
+            let batch_format = batch_format.clone();
+            let batch_digest = batch_format.digest()?;
+            let mut current = Vec::new();
+            while current.len() < ASYNC_NODE_PREFETCH_BATCH_SIZE
+                && frontier
+                    .front()
+                    .is_some_and(|(_, format)| *format == batch_format)
+            {
+                if let Some((cid, _)) = frontier.pop_front() {
+                    current.push(cid);
+                }
+            }
             let loaded = self
-                .load_child_frontier_ordered_for_format(&current, &tree.config.format)
+                .load_child_frontier_ordered_for_format(&current, &batch_format)
                 .await?;
 
             for (cid, node) in current.into_iter().zip(loaded) {
                 if node.keys.len() != node.vals.len() {
                     return Err(Error::InvalidNode);
+                }
+                let mut queue = |child: Cid, format: &format::TreeFormat, digest: Cid| {
+                    if paths.insert((child.clone(), digest)) {
+                        if unique.insert(child.clone()) && unique.len() > limits.max_nodes {
+                            return Err(Error::SnapshotExportLimitExceeded {
+                                resource: "nodes",
+                                limit: limits.max_nodes,
+                                actual: unique.len(),
+                            });
+                        }
+                        frontier.push_back((child, format.clone()));
+                    }
+                    Ok(())
+                };
+                if node.leaf {
+                    for value in &node.vals {
+                        if let blob::StoredValueEdge::Tree(reference) =
+                            blob::stored_value_edge(value)?
+                        {
+                            if let Some(child) = reference.root() {
+                                queue(
+                                    child.clone(),
+                                    reference.format(),
+                                    reference.format().digest()?,
+                                )?;
+                            }
+                        }
+                    }
+                } else {
+                    for idx in 0..node.len() {
+                        queue(
+                            child_cid_at(&node, idx)?,
+                            &batch_format,
+                            batch_digest.clone(),
+                        )?;
+                    }
+                }
+                if !exported.insert(cid.clone()) {
+                    continue;
                 }
                 let bytes = node.to_bytes();
                 self::sync::verify_node_bytes(&cid, &bytes)?;
@@ -5674,22 +5742,6 @@ where
                         limit: limits.max_bytes,
                         actual: byte_count,
                     });
-                }
-
-                if !node.leaf {
-                    for idx in 0..node.len() {
-                        let child = child_cid_at(&node, idx)?;
-                        if seen.insert(child.clone()) {
-                            if seen.len() > limits.max_nodes {
-                                return Err(Error::SnapshotExportLimitExceeded {
-                                    resource: "nodes",
-                                    limit: limits.max_nodes,
-                                    actual: seen.len(),
-                                });
-                            }
-                            frontier.push_back(child);
-                        }
-                    }
                 }
                 nodes.push(SnapshotBundleNode { cid, bytes });
             }
@@ -5977,26 +6029,35 @@ where
                     scanned_values += node.vals.len();
                     enforce_content_graph_limit("values", limits.max_values, scanned_values)?;
                     for value in &node.vals {
-                        if let blob::ValueRef::Blob(reference) =
-                            blob::ValueRef::from_stored_bytes(value)?
-                        {
-                            match live_blobs_by_cid.entry(reference.cid.clone()) {
-                                Entry::Occupied(entry) => {
-                                    if entry.get().len != reference.len {
-                                        return Err(Error::Deserialize(
-                                            "conflicting blob reference lengths for same CID"
-                                                .to_string(),
-                                        ));
-                                    }
+                        let reference = match blob::stored_value_edge(value)? {
+                            blob::StoredValueEdge::None => continue,
+                            blob::StoredValueEdge::Tree(reference) => {
+                                push_tree_ref_edge(
+                                    &reference,
+                                    &mut seen_paths,
+                                    &mut next_frontier,
+                                    limits.max_nodes,
+                                )?;
+                                continue;
+                            }
+                            blob::StoredValueEdge::Blob(reference) => reference,
+                        };
+                        match live_blobs_by_cid.entry(reference.cid.clone()) {
+                            Entry::Occupied(entry) => {
+                                if entry.get().len != reference.len {
+                                    return Err(Error::Deserialize(
+                                        "conflicting blob reference lengths for same CID"
+                                            .to_string(),
+                                    ));
                                 }
-                                Entry::Vacant(entry) => {
-                                    entry.insert(reference);
-                                    enforce_content_graph_limit(
-                                        "blobs",
-                                        limits.max_blobs,
-                                        live_blobs_by_cid.len(),
-                                    )?;
-                                }
+                            }
+                            Entry::Vacant(entry) => {
+                                entry.insert(reference);
+                                enforce_content_graph_limit(
+                                    "blobs",
+                                    limits.max_blobs,
+                                    live_blobs_by_cid.len(),
+                                )?;
                             }
                         }
                     }
@@ -7894,6 +7955,46 @@ fn reverse_scan_end<'a>(
         (None, None) => None,
     }
 }
+/// Frontier entry for format-aware closure traversal: node CID, expected
+/// persisted format, and that format's digest.
+type FormatFrontierEntry = (Cid, format::TreeFormat, Cid);
+
+/// Queue the root of a tree reference so closure traversal follows it under
+/// the reference's declared format. Every `(cid, format)` requirement is
+/// queued separately, so a second, incompatible declaration for an already
+/// visited CID is still loaded and rejected by the node format check.
+fn push_tree_ref_edge(
+    reference: &tree::TreeRef,
+    seen_paths: &mut HashSet<(Cid, Cid)>,
+    frontier: &mut Vec<FormatFrontierEntry>,
+    max_nodes: usize,
+) -> Result<(), Error> {
+    let Some(root) = reference.root() else {
+        return Ok(());
+    };
+    let format_digest = reference.format().digest()?;
+    if seen_paths.insert((root.clone(), format_digest.clone())) {
+        enforce_content_graph_limit("nodes", max_nodes, seen_paths.len())?;
+        frontier.push((root.clone(), reference.format().clone(), format_digest));
+    }
+    Ok(())
+}
+
+/// Queue every tree reference declared by a leaf's stored values.
+fn push_leaf_tree_edges(
+    node: &Node,
+    seen_paths: &mut HashSet<(Cid, Cid)>,
+    frontier: &mut Vec<FormatFrontierEntry>,
+    max_nodes: usize,
+) -> Result<(), Error> {
+    for value in &node.vals {
+        if let blob::StoredValueEdge::Tree(reference) = blob::stored_value_edge(value)? {
+            push_tree_ref_edge(&reference, seen_paths, frontier, max_nodes)?;
+        }
+    }
+    Ok(())
+}
+
 fn child_cid_at(node: &Node, idx: usize) -> Result<Cid, Error> {
     let child = node.vals.get(idx).ok_or(Error::InvalidNode)?;
     Ok(Cid(child
