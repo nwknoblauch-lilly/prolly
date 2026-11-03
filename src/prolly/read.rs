@@ -14,7 +14,7 @@ use super::error::{Conflict, Diff, Error};
 use super::key;
 use super::node::ReadNode;
 use super::store::{AsyncStore, Store, SyncStoreAsAsync};
-use super::tree::Tree;
+use super::tree::{Tree, TreeRef};
 use super::AsyncProlly;
 use super::{sorted_key_positions, InlinePositions, KeyLookupFrame, KeyValue, Prolly};
 
@@ -84,6 +84,8 @@ pub enum ValueRefView<'a> {
     Inline(&'a [u8]),
     /// Validated content-addressed blob reference.
     Blob { cid: Cid, len: u64 },
+    /// Validated reference to another ordered tree. The target is not loaded.
+    Tree(TreeRef),
 }
 
 impl ValueRefView<'_> {
@@ -92,6 +94,7 @@ impl ValueRefView<'_> {
         match self {
             Self::Inline(value) => blob::ValueRef::Inline(value.to_vec()),
             Self::Blob { cid, len } => blob::ValueRef::Blob(blob::BlobRef { cid, len }),
+            Self::Tree(reference) => blob::ValueRef::Tree(reference),
         }
     }
 }

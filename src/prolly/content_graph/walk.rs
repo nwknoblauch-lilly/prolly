@@ -1,6 +1,8 @@
 use super::kind::{ContentObjectKind, TypedContentObject, TypedContentRoot};
+use crate::prolly::blob::{stored_value_edge, StoredValueEdge};
 use crate::prolly::cid::Cid;
 use crate::prolly::error::Error;
+use crate::prolly::format::TreeFormat;
 use crate::prolly::node::Node;
 use crate::prolly::proximity::accelerator::catalog::{
     CatalogAcceleratorKind, Manifest as CatalogManifest,
@@ -64,8 +66,11 @@ pub fn walk_content_graph<S: Store>(
         .collect();
     let mut visiting = HashSet::<Cid>::new();
     let mut seen = HashSet::<Cid>::new();
+    // Longest descendant path, in edges, below each completed object.
+    let mut heights = HashMap::<Cid, usize>::new();
     let mut contexts = HashMap::<Cid, (ContentObjectKind, Option<u32>)>::new();
     let mut pending = HashMap::<Cid, TypedContentObject>::new();
+    let mut formats = OrderedFormats::default();
     let mut walk = ContentGraphWalk::default();
     let mut loaded_bytes = 0usize;
 
@@ -85,6 +90,16 @@ pub fn walk_content_graph<S: Store>(
                     }
                 }
                 if seen.contains(&root.cid) {
+                    // The object is already loaded, but this path may be
+                    // longer: check the deepest descendant along it.
+                    let deepest =
+                        depth.saturating_add(heights.get(&root.cid).copied().ok_or_else(|| {
+                            invalid("completed content object has no recorded height")
+                        })?);
+                    if deepest > limits.max_depth {
+                        return Err(limit("depth", limits.max_depth, deepest));
+                    }
+                    walk.maximum_depth = walk.maximum_depth.max(deepest);
                     continue;
                 }
                 if !visiting.insert(root.cid.clone()) {
@@ -99,7 +114,7 @@ pub fn walk_content_graph<S: Store>(
                     return Err(limit("bytes", limits.max_bytes, next_bytes));
                 }
                 loaded_bytes = next_bytes;
-                let (actual_kind, mut references) = references(&root, &bytes)?;
+                let (actual_kind, mut references) = references(&root, &bytes, &mut formats)?;
                 if references.len() > limits.max_references_per_object {
                     return Err(limit(
                         "references",
@@ -119,13 +134,18 @@ pub fn walk_content_graph<S: Store>(
                     depth,
                 };
                 pending.insert(root.cid.clone(), object);
-                stack.push(Frame::Exit(root.cid));
+                let children = references
+                    .iter()
+                    .map(|reference| reference.cid.clone())
+                    .collect();
+                stack.push(Frame::Exit(root.cid, children));
                 for reference in references.into_iter().rev() {
                     stack.push(Frame::Enter(reference, depth + 1));
                 }
             }
-            Frame::Exit(cid) => {
+            Frame::Exit(cid, children) => {
                 visiting.remove(&cid);
+                heights.insert(cid.clone(), subtree_height(&heights, &children)?);
                 if seen.insert(cid.clone()) {
                     let object = pending.remove(&cid).expect("entered content object");
                     walk.total_bytes = walk.total_bytes.saturating_add(object.bytes.len());
@@ -160,8 +180,11 @@ where
         .collect();
     let mut visiting = HashSet::<Cid>::new();
     let mut seen = HashSet::<Cid>::new();
+    // Longest descendant path, in edges, below each completed object.
+    let mut heights = HashMap::<Cid, usize>::new();
     let mut contexts = HashMap::<Cid, (ContentObjectKind, Option<u32>)>::new();
     let mut pending = HashMap::<Cid, TypedContentObject>::new();
+    let mut formats = OrderedFormats::default();
     let mut prefetched = HashMap::<Cid, Vec<u8>>::new();
     let mut walk = ContentGraphWalk::default();
     let mut loaded_bytes = 0usize;
@@ -183,6 +206,16 @@ where
                     }
                 }
                 if seen.contains(&root.cid) {
+                    // The object is already loaded, but this path may be
+                    // longer: check the deepest descendant along it.
+                    let deepest =
+                        depth.saturating_add(heights.get(&root.cid).copied().ok_or_else(|| {
+                            invalid("completed content object has no recorded height")
+                        })?);
+                    if deepest > limits.max_depth {
+                        return Err(limit("depth", limits.max_depth, deepest));
+                    }
+                    walk.maximum_depth = walk.maximum_depth.max(deepest);
                     continue;
                 }
                 if !visiting.insert(root.cid.clone()) {
@@ -204,7 +237,7 @@ where
                     return Err(limit("bytes", limits.max_bytes, reserved_bytes));
                 }
                 loaded_bytes = next_bytes;
-                let (actual_kind, mut references) = references(&root, &bytes)?;
+                let (actual_kind, mut references) = references(&root, &bytes, &mut formats)?;
                 if references.len() > limits.max_references_per_object {
                     return Err(limit(
                         "references",
@@ -238,13 +271,18 @@ where
                         depth,
                     },
                 );
-                stack.push(Frame::Exit(root.cid));
+                let children = references
+                    .iter()
+                    .map(|reference| reference.cid.clone())
+                    .collect();
+                stack.push(Frame::Exit(root.cid, children));
                 for reference in references.into_iter().rev() {
                     stack.push(Frame::Enter(reference, depth + 1));
                 }
             }
-            Frame::Exit(cid) => {
+            Frame::Exit(cid, children) => {
                 visiting.remove(&cid);
+                heights.insert(cid.clone(), subtree_height(&heights, &children)?);
                 if seen.insert(cid.clone()) {
                     let object = pending.remove(&cid).expect("entered content object");
                     walk.total_bytes = walk.total_bytes.saturating_add(object.bytes.len());
@@ -428,7 +466,7 @@ pub fn content_references<S: Store>(
     root: &TypedContentRoot,
 ) -> Result<Vec<TypedContentRoot>, Error> {
     let bytes = load_content(store, &root.cid)?;
-    let (_, mut output) = references(root, &bytes)?;
+    let (_, mut output) = references(root, &bytes, &mut OrderedFormats::default())?;
     output.sort_by(compare_root);
     output.dedup();
     Ok(output)
@@ -443,7 +481,7 @@ where
     S::Error: Send + Sync,
 {
     let bytes = load_content_async(store, &root.cid).await?;
-    let (_, mut output) = references(root, &bytes)?;
+    let (_, mut output) = references(root, &bytes, &mut OrderedFormats::default())?;
     output.sort_by(compare_root);
     output.dedup();
     Ok(output)
@@ -464,12 +502,86 @@ fn is_proximity_node_kind(kind: ContentObjectKind) -> bool {
 
 enum Frame {
     Enter(TypedContentRoot, usize),
-    Exit(Cid),
+    /// Leave an object; carries its direct reference CIDs for height tracking.
+    Exit(Cid, Vec<Cid>),
+}
+
+/// Height of an object whose direct references have all completed.
+fn subtree_height(heights: &HashMap<Cid, usize>, children: &[Cid]) -> Result<usize, Error> {
+    children.iter().try_fold(0usize, |height, child| {
+        let child_height = heights
+            .get(child)
+            .copied()
+            .ok_or_else(|| invalid("content reference completed without a recorded height"))?;
+        Ok(height.max(child_height.saturating_add(1)))
+    })
+}
+
+/// Persisted-format constraints on ordered nodes discovered during one walk.
+///
+/// Tree-reference edges declare the format their target root must have. The
+/// typed root carries no format, so the walker tracks declarations and the
+/// observed format of every loaded ordered node here and rejects a mismatch
+/// regardless of which is seen first.
+#[derive(Default)]
+struct OrderedFormats {
+    distinct: Vec<TreeFormat>,
+    observed: HashMap<Cid, usize>,
+    required: HashMap<Cid, usize>,
+}
+
+impl OrderedFormats {
+    fn intern(&mut self, format: &TreeFormat) -> usize {
+        match self.distinct.iter().position(|known| known == format) {
+            Some(index) => index,
+            None => {
+                self.distinct.push(format.clone());
+                self.distinct.len() - 1
+            }
+        }
+    }
+
+    fn observe(&mut self, cid: &Cid, format: &TreeFormat) -> Result<(), Error> {
+        let index = self.intern(format);
+        if self
+            .required
+            .get(cid)
+            .is_some_and(|required| *required != index)
+        {
+            return Err(tree_format_mismatch());
+        }
+        self.observed.insert(cid.clone(), index);
+        Ok(())
+    }
+
+    fn require(&mut self, cid: &Cid, format: &TreeFormat) -> Result<(), Error> {
+        let index = self.intern(format);
+        if self
+            .observed
+            .get(cid)
+            .is_some_and(|observed| *observed != index)
+        {
+            return Err(tree_format_mismatch());
+        }
+        match self.required.get(cid) {
+            Some(required) if *required != index => Err(tree_format_mismatch()),
+            Some(_) => Ok(()),
+            None => {
+                self.required.insert(cid.clone(), index);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn tree_format_mismatch() -> Error {
+    invalid("tree reference format does not match the referenced ordered node")
 }
 
 fn references(
     root: &TypedContentRoot,
     bytes: &[u8],
+    formats: &mut OrderedFormats,
 ) -> Result<(ContentObjectKind, Vec<TypedContentRoot>), Error> {
     validate_root_context(root)?;
     let mut output = Vec::new();
@@ -479,11 +591,25 @@ fn references(
             if node.keys.len() != node.vals.len() {
                 return Err(invalid("ordered node key/value count mismatch"));
             }
-            if !node.leaf {
+            formats.observe(&root.cid, &node.format)?;
+            if node.leaf {
+                for value in &node.vals {
+                    if let StoredValueEdge::Tree(reference) = stored_value_edge(value)? {
+                        let Some(cid) = reference.root().cloned() else {
+                            continue;
+                        };
+                        formats.require(&cid, reference.format())?;
+                        output.push(TypedContentRoot::new(ContentObjectKind::OrderedNode, cid));
+                    }
+                }
+            } else {
                 for value in node.vals {
                     let cid = Cid(value
                         .try_into()
                         .map_err(|_| invalid("ordered internal value is not a CID"))?);
+                    // Structural children inherit the parent's format; only
+                    // leaf tree-reference edges may change format.
+                    formats.require(&cid, &node.format)?;
                     output.push(TypedContentRoot::new(ContentObjectKind::OrderedNode, cid));
                 }
             }

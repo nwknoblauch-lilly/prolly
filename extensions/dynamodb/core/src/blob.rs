@@ -110,6 +110,7 @@ impl BlobLayer {
                 reference.validate_bytes(&bytes)?;
                 Ok(bytes)
             }
+            ValueRef::Tree(_) => Err(unsupported_tree_ref()),
         }
     }
 
@@ -131,4 +132,11 @@ impl BlobLayer {
         }
         Ok(())
     }
+}
+
+/// This extension stores only Inline and Blob values and does not follow
+/// tree-valued references through its blob registry, archives, or GC. It
+/// rejects them rather than skipping a possible reachability edge.
+pub(crate) fn unsupported_tree_ref() -> Error {
+    Error::CorruptData("tree value references are not supported by prolly-dynamodb".into())
 }

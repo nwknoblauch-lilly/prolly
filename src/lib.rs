@@ -433,7 +433,7 @@ pub use prolly::transaction::{
     OwnedProllyTransaction, ProllyTransaction, RootCondition, RootWrite, TransactionConflict,
     TransactionNodeWrite, TransactionOverlayError, TransactionUpdate, TransactionalStore,
 };
-pub use prolly::tree::Tree;
+pub use prolly::tree::{Tree, TreeRef};
 pub use prolly::value::{
     decode_cbor, decode_json, encode_cbor, encode_json, CborCodec, JsonCodec, ValueCodec,
     VersionedCborCodec, VersionedJsonCodec, VersionedValue,

@@ -500,7 +500,7 @@ fn borrowed_large_value_views_match_owned_decoding() {
         prolly
             .get_value_ref_with(&tree, b"escaped", |view| match view {
                 ValueRefView::Inline(value) => value.to_vec(),
-                ValueRefView::Blob { .. } => unreachable!(),
+                ValueRefView::Blob { .. } | ValueRefView::Tree(_) => unreachable!(),
             })
             .unwrap(),
         Some(b"PLVB-inline".to_vec())

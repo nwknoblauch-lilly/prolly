@@ -14,11 +14,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::cid::Cid;
 use super::error::Error;
 use super::read::ValueRefView;
+use super::tree::TreeRef;
 
 const VALUE_REF_MAGIC: &[u8; 4] = b"PLVB";
 const VALUE_REF_VERSION: u8 = 1;
 const VALUE_REF_INLINE: u8 = 0;
 const VALUE_REF_BLOB: u8 = 1;
+const VALUE_REF_TREE: u8 = 2;
 const VALUE_REF_HEADER_LEN: usize = 6;
 const U64_LEN: usize = 8;
 
@@ -59,10 +61,34 @@ pub(crate) fn value_ref_view_from_stored_bytes(bytes: &[u8]) -> Result<ValueRefV
             let len = read_u64(bytes, &mut offset, "blob length")?;
             Ok(ValueRefView::Blob { cid: Cid(cid), len })
         }
+        VALUE_REF_TREE => Ok(ValueRefView::Tree(decode_tree_ref_body(bytes)?)),
         tag => Err(value_ref_error(format!(
             "unknown value reference tag {tag}"
         ))),
     }
+}
+
+/// Closure edge declared by the outer envelope of one stored leaf value.
+///
+/// Only the outer envelope is interpreted: raw bytes and Inline payloads are
+/// opaque, blob payloads are never parsed, and empty tree references declare
+/// no node edge. Malformed or unknown envelopes are errors so closure
+/// traversal never silently ignores a possible edge.
+pub(crate) enum StoredValueEdge {
+    None,
+    Blob(BlobRef),
+    Tree(TreeRef),
+}
+
+pub(crate) fn stored_value_edge(bytes: &[u8]) -> Result<StoredValueEdge, Error> {
+    Ok(match value_ref_view_from_stored_bytes(bytes)? {
+        ValueRefView::Inline(_) => StoredValueEdge::None,
+        ValueRefView::Blob { cid, len } => StoredValueEdge::Blob(BlobRef { cid, len }),
+        ValueRefView::Tree(reference) if reference.root().is_some() => {
+            StoredValueEdge::Tree(reference)
+        }
+        ValueRefView::Tree(_) => StoredValueEdge::None,
+    })
 }
 
 /// Default maximum value size stored directly in leaf nodes by large-value
@@ -94,12 +120,18 @@ impl BlobRef {
 }
 
 /// Value stored in a leaf by the large-value helper layer.
+///
+/// Closure operations (`mark_reachable`, node copy, snapshot export and
+/// verification, GC) interpret only the outer envelope: `Blob` and `Tree`
+/// declare edges, while `Inline` payloads and blob bytes stay opaque.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueRef {
     /// Inline value bytes.
     Inline(Vec<u8>),
     /// Content-addressed blob reference.
     Blob(BlobRef),
+    /// Reference to another immutable ordered tree.
+    Tree(TreeRef),
 }
 
 impl ValueRef {
@@ -118,6 +150,22 @@ impl ValueRef {
                 write_header(&mut out, VALUE_REF_BLOB);
                 out.extend_from_slice(reference.cid.as_bytes());
                 out.extend_from_slice(&reference.len.to_be_bytes());
+                out
+            }
+            Self::Tree(reference) => {
+                let format = reference.format_bytes();
+                let mut out =
+                    Vec::with_capacity(VALUE_REF_HEADER_LEN + 1 + 32 + U64_LEN + format.len());
+                write_header(&mut out, VALUE_REF_TREE);
+                match reference.root() {
+                    Some(root) => {
+                        out.push(1);
+                        out.extend_from_slice(root.as_bytes());
+                    }
+                    None => out.push(0),
+                }
+                out.extend_from_slice(&(format.len() as u64).to_be_bytes());
+                out.extend_from_slice(format);
                 out
             }
         }
@@ -1128,6 +1176,7 @@ where
             validate_blob_reference(&reference, &bytes)?;
             Ok(bytes)
         }
+        ValueRef::Tree(_) => Err(tree_as_bytes_error()),
     }
 }
 pub(crate) async fn encode_stored_value_async<B>(
@@ -1173,6 +1222,7 @@ where
             validate_blob_reference(&reference, &bytes)?;
             Ok(bytes)
         }
+        ValueRef::Tree(_) => Err(tree_as_bytes_error()),
     }
 }
 
@@ -1199,6 +1249,7 @@ fn decode_value_ref(bytes: &[u8]) -> Result<ValueRef, Error> {
     match bytes[5] {
         VALUE_REF_INLINE => decode_inline_ref(bytes),
         VALUE_REF_BLOB => decode_blob_ref(bytes),
+        VALUE_REF_TREE => Ok(ValueRef::Tree(decode_tree_ref_body(bytes)?)),
         tag => Err(value_ref_error(format!(
             "unknown value reference tag {tag}"
         ))),
@@ -1244,6 +1295,37 @@ fn declared_len_matches_remaining(bytes: &[u8], offset: usize, declared: u64) ->
     u64::try_from(bytes.len().saturating_sub(offset)) == Ok(declared)
 }
 
+/// Decode the body of a tag-2 envelope whose header was already checked.
+fn decode_tree_ref_body(bytes: &[u8]) -> Result<TreeRef, Error> {
+    let mut offset = VALUE_REF_HEADER_LEN;
+    let root = match bytes.get(offset) {
+        None => return Err(value_ref_error("tree root flag is truncated")),
+        Some(0) => {
+            offset += 1;
+            None
+        }
+        Some(1) => {
+            offset += 1;
+            let Some(raw) = bytes.get(offset..offset + 32) else {
+                return Err(value_ref_error("tree root CID is truncated"));
+            };
+            let mut cid = [0u8; 32];
+            cid.copy_from_slice(raw);
+            offset += 32;
+            Some(Cid(cid))
+        }
+        Some(flag) => {
+            return Err(value_ref_error(format!("invalid tree root flag {flag}")));
+        }
+    };
+    let format_len = read_u64(bytes, &mut offset, "tree format length")?;
+    if !declared_len_matches_remaining(bytes, offset, format_len) {
+        return Err(value_ref_error("tree format length does not match payload"));
+    }
+    TreeRef::from_canonical_parts(root, &bytes[offset..])
+        .map_err(|err| value_ref_error(format!("invalid tree format: {err}")))
+}
+
 fn read_u64(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64, Error> {
     let end = offset.saturating_add(U64_LEN);
     let Some(raw) = bytes.get(*offset..end) else {
@@ -1266,6 +1348,11 @@ fn validate_blob_reference(reference: &BlobRef, bytes: &[u8]) -> Result<(), Erro
     }
 
     Ok(())
+}
+
+/// Error returned when a byte-only resolver encounters a tree reference.
+pub(crate) fn tree_as_bytes_error() -> Error {
+    value_ref_error("tree references cannot be resolved as bytes; use get_value_ref")
 }
 
 fn value_ref_error(message: impl Into<String>) -> Error {

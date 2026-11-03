@@ -281,15 +281,18 @@ pub(crate) fn referenced_blobs(snapshot: &SnapshotBundle) -> Result<BTreeMap<Cid
             continue;
         }
         for value in &node.vals {
-            if let ValueRef::Blob(reference) = ValueRef::from_stored_bytes(value)? {
-                match references.insert(reference.cid.clone(), reference.len) {
-                    Some(existing) if existing != reference.len => {
-                        return Err(Error::CorruptData(
-                            "snapshot contains conflicting lengths for one blob CID".into(),
-                        ));
-                    }
-                    _ => {}
+            let reference = match ValueRef::from_stored_bytes(value)? {
+                ValueRef::Blob(reference) => reference,
+                ValueRef::Inline(_) => continue,
+                ValueRef::Tree(_) => return Err(crate::blob::unsupported_tree_ref()),
+            };
+            match references.insert(reference.cid.clone(), reference.len) {
+                Some(existing) if existing != reference.len => {
+                    return Err(Error::CorruptData(
+                        "snapshot contains conflicting lengths for one blob CID".into(),
+                    ));
                 }
+                _ => {}
             }
         }
     }
@@ -363,6 +366,24 @@ mod tests {
                 bytes: blob_bytes,
             }],
         }
+    }
+
+    #[test]
+    fn referenced_blobs_rejects_tree_value_references() {
+        let manager = Prolly::new(Arc::new(MemStore::new()), Config::default());
+        let reference = prolly::TreeRef::new(None, prolly::TreeFormat::default()).unwrap();
+        let tree = manager
+            .put(
+                &manager.create(),
+                b"child".to_vec(),
+                ValueRef::Tree(reference).to_bytes(),
+            )
+            .unwrap();
+        let snapshot = manager.export_snapshot(&tree).unwrap();
+        assert!(matches!(
+            referenced_blobs(&snapshot),
+            Err(Error::CorruptData(_))
+        ));
     }
 
     #[test]

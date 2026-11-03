@@ -237,8 +237,9 @@ Blob garbage collection is intentionally separate from node GC because
 applications may share blobs across maps or external object stores. The blob GC
 contract mirrors node GC:
 
-- `mark_reachable_blobs` scans retained trees for reachable `ValueRef::Blob`
-  envelopes and deduplicates by blob CID.
+- `mark_reachable_blobs` scans retained trees, including trees referenced
+  through `ValueRef::Tree`, for reachable `ValueRef::Blob` envelopes and
+  deduplicates by blob CID.
 - `plan_blob_gc` accepts caller-supplied `BlobRef` candidates, keeps reachable
   candidates, validates present unreachable blob bytes against their reference,
   and reports missing candidates separately.
@@ -269,7 +270,10 @@ GC invariants:
 - Retained roots must be complete. The caller is responsible for loading every
   branch, checkpoint, workspace, and sync cursor that should survive.
 - `mark_reachable` walks retained tree roots breadth-first, deduplicates shared
-  subtrees, and returns live CIDs sorted by CID bytes.
+  subtrees, and returns live CIDs sorted by CID bytes. Leaf values holding a
+  `ValueRef::Tree` envelope are followed into the referenced tree under its
+  declared format; missing targets, format mismatches, and malformed envelopes
+  fail marking, so no sweep runs from a partial plan.
 - `plan_gc` must not mutate the store. It reports only caller-supplied
   candidates that are both unreachable and present in the store.
 - Missing candidates are counted separately from reclaimable nodes and bytes.

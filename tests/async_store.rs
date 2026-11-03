@@ -3525,3 +3525,63 @@ fn async_prolly_runs_over_tokio_blocking_store() {
     assert_eq!(sync_prolly.get(&tree, b"c").unwrap(), Some(b"3".to_vec()));
     assert_tree_invariants(&store, &tree, &config);
 }
+
+#[test]
+fn async_closure_operations_follow_tree_refs_like_sync() {
+    block_on(async {
+        let store = Arc::new(MemStore::new());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(2)
+            .build();
+        let sync = Prolly::new(store.clone(), config.clone());
+        let mut child = sync.create();
+        for index in 0..30u32 {
+            child = sync
+                .put(&child, index.to_be_bytes().to_vec(), b"child".to_vec())
+                .unwrap();
+        }
+        let reference = prolly::TreeRef::try_from(&child).unwrap();
+        let parent = sync
+            .put(
+                &sync.create(),
+                b"child".to_vec(),
+                ValueRef::Tree(reference).to_bytes(),
+            )
+            .unwrap();
+
+        let async_prolly = AsyncProlly::new(SyncStoreAsAsync::new(store.clone()), config.clone());
+        let expected = sync.mark_reachable(std::slice::from_ref(&parent)).unwrap();
+        let actual = async_prolly
+            .mark_reachable(std::slice::from_ref(&parent))
+            .await
+            .unwrap();
+        assert_eq!(actual.live_cids, expected.live_cids);
+        assert!(actual.contains(child.root.as_ref().unwrap()));
+
+        let bundle = async_prolly.export_snapshot(&parent).await.unwrap();
+        assert_eq!(bundle.nodes.len(), expected.live_nodes);
+        assert!(bundle.verify().unwrap().valid);
+
+        let destination = SyncStoreAsAsync::new(Arc::new(MemStore::new()));
+        let copied = async_prolly
+            .copy_missing_nodes(&parent, &destination)
+            .await
+            .unwrap();
+        assert_eq!(copied.copied_nodes, expected.live_nodes);
+
+        let roots = [prolly::TypedContentRoot::new(
+            prolly::ContentObjectKind::OrderedNode,
+            parent.root.clone().unwrap(),
+        )];
+        let walk = prolly::walk_content_graph_async(
+            &SyncStoreAsAsync::new(store.clone()),
+            &roots,
+            &prolly::ContentGraphLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(walk.objects.len(), expected.live_nodes);
+    });
+}

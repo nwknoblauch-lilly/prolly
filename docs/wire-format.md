@@ -14,6 +14,13 @@ conformance fixtures are generated from Rust.
 
 ## Node Format: `CRAB` Version 1
 
+> **Out of date.** The current writer emits `CRAB` version `2`
+> (`COMPACT_VERSION` in `src/prolly/node.rs`), and the version-2 layout is not
+> described here. Treat the generated node fixtures in
+> `conformance/prolly-fixtures.v1.json` and the Rust implementation as the
+> source of truth for node bytes. Tree-valued references do not change the
+> node format.
+
 New nodes are encoded in a deterministic compact binary format:
 
 1. magic bytes: ASCII `CRAB`
@@ -95,9 +102,21 @@ Ports must match the Rust xxHash64 result exactly for writer compatibility.
 
 - magic `PLVB`
 - one-byte version `1`
-- one-byte kind: `0` inline, `1` blob
+- one-byte kind: `0` inline, `1` blob, `2` tree
 - inline: big-endian `u64` length plus value bytes
 - blob: 32-byte blob CID plus big-endian `u64` blob length
+- tree: one-byte root flag (`0` empty, `1` present), the 32-byte root CID when
+  present, big-endian `u64` format length, then exactly that many bytes of
+  `TreeFormat::canonical_bytes()`. Empty references still carry the format.
+  Runtime configuration is never encoded. Decoders reject invalid root flags,
+  truncation, length mismatches, trailing bytes, and format bytes that do not
+  re-encode identically.
+
+Closure operations (reachability, GC, node copy, snapshot export and
+verification) follow tree envelopes under their declared format. Decoders that
+predate tag `2` reject it, but older node GC ignores leaf values; upgrade every
+GC and closure-verification process before storing tree references in shared
+data.
 
 Non-`PLVB` stored values are interpreted as inline bytes by large-value helpers.
 

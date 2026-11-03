@@ -3310,6 +3310,7 @@ where
                 let blob = match ValueRef::from_stored_bytes(&stored)? {
                     ValueRef::Blob(reference) => Some(reference),
                     ValueRef::Inline(_) => None,
+                    ValueRef::Tree(_) => return Err(crate::blob::unsupported_tree_ref()),
                 };
                 let indexed = prepare_index_source_record(
                     bulk_description,
@@ -8860,8 +8861,10 @@ fn blob_references_from_mutations(
         let Mutation::Upsert { val, .. } = mutation else {
             continue;
         };
-        let ValueRef::Blob(reference) = ValueRef::from_stored_bytes(val)? else {
-            continue;
+        let reference = match ValueRef::from_stored_bytes(val)? {
+            ValueRef::Blob(reference) => reference,
+            ValueRef::Inline(_) => continue,
+            ValueRef::Tree(_) => return Err(crate::blob::unsupported_tree_ref()),
         };
         match references.insert(reference.cid.clone(), reference.clone()) {
             Some(existing) if existing.len != reference.len => {
@@ -8939,6 +8942,19 @@ fn decode_description(bytes: &[u8]) -> Result<TableDescription> {
 #[cfg(test)]
 mod maintenance_format_tests {
     use super::*;
+
+    #[test]
+    fn blob_reference_scan_rejects_tree_value_references() {
+        let reference = prolly::TreeRef::new(None, prolly::TreeFormat::default()).unwrap();
+        let mutations = vec![Mutation::Upsert {
+            key: b"child".to_vec(),
+            val: ValueRef::Tree(reference).to_bytes(),
+        }];
+        assert!(matches!(
+            blob_references_from_mutations(&mutations),
+            Err(Error::CorruptData(_))
+        ));
+    }
 
     #[test]
     fn detached_snapshot_locator_is_compact_canonical_and_timestamp_free() {
