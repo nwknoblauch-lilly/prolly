@@ -40,9 +40,8 @@ pub(crate) fn value_ref_view_from_stored_bytes(bytes: &[u8]) -> Result<ValueRefV
     match bytes[5] {
         VALUE_REF_INLINE => {
             let mut offset = VALUE_REF_HEADER_LEN;
-            let len = usize::try_from(read_u64(bytes, &mut offset, "inline value length")?)
-                .map_err(|_| value_ref_error("inline value length exceeds platform limits"))?;
-            if bytes.len().saturating_sub(offset) != len {
+            let len = read_u64(bytes, &mut offset, "inline value length")?;
+            if !declared_len_matches_remaining(bytes, offset, len) {
                 return Err(value_ref_error(
                     "inline value length does not match payload",
                 ));
@@ -1208,8 +1207,8 @@ fn decode_value_ref(bytes: &[u8]) -> Result<ValueRef, Error> {
 
 fn decode_inline_ref(bytes: &[u8]) -> Result<ValueRef, Error> {
     let mut offset = VALUE_REF_HEADER_LEN;
-    let len = read_u64(bytes, &mut offset, "inline value length")? as usize;
-    if bytes.len().saturating_sub(offset) != len {
+    let len = read_u64(bytes, &mut offset, "inline value length")?;
+    if !declared_len_matches_remaining(bytes, offset, len) {
         return Err(value_ref_error(
             "inline value length does not match payload",
         ));
@@ -1231,6 +1230,18 @@ fn decode_blob_ref(bytes: &[u8]) -> Result<ValueRef, Error> {
         cid: Cid(cid_bytes),
         len,
     }))
+}
+
+/// Whether a length declared by the wire format equals the bytes remaining
+/// after `offset`.
+///
+/// The declared length is a format-defined `u64`, not an in-memory size, so the
+/// comparison happens in `u64`: the remaining count widens losslessly instead
+/// of the declared length being narrowed to `usize`. That keeps the result
+/// platform-independent; on 32-bit targets a narrowing cast would truncate an
+/// oversized declared length and could accept a malformed envelope.
+fn declared_len_matches_remaining(bytes: &[u8], offset: usize, declared: u64) -> bool {
+    u64::try_from(bytes.len().saturating_sub(offset)) == Ok(declared)
 }
 
 fn read_u64(bytes: &[u8], offset: &mut usize, context: &str) -> Result<u64, Error> {
@@ -1283,6 +1294,37 @@ mod tests {
             blob.clone()
         );
         assert_eq!(ValueRef::from_stored_bytes(&blob.to_bytes()).unwrap(), blob);
+    }
+
+    #[test]
+    fn inline_length_is_checked_in_the_wire_domain() {
+        let payload = b"short";
+        // Each declared length differs from the payload length, including ones
+        // whose low 32 bits equal it, which a narrowing cast would truncate to
+        // a match on 32-bit targets.
+        for declared in [
+            (1u64 << 32) + payload.len() as u64,
+            (1u64 << 63) | payload.len() as u64,
+            u64::MAX,
+            payload.len() as u64 + 1,
+        ] {
+            let mut envelope = VALUE_REF_MAGIC.to_vec();
+            envelope.extend_from_slice(&[VALUE_REF_VERSION, VALUE_REF_INLINE]);
+            envelope.extend_from_slice(&declared.to_be_bytes());
+            envelope.extend_from_slice(payload);
+
+            let owned = ValueRef::from_bytes(&envelope).unwrap_err();
+            let borrowed = value_ref_view_from_stored_bytes(&envelope).unwrap_err();
+            assert!(
+                matches!(owned, Error::Deserialize(_)),
+                "declared {declared}"
+            );
+            assert_eq!(
+                owned.to_string(),
+                borrowed.to_string(),
+                "owned and borrowed decoders disagree for declared {declared}"
+            );
+        }
     }
 
     #[test]
