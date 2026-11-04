@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix append-only merges into a single-leaf tree, which could wrap the merged
+  leaf in a one-child internal root and return a non-canonical root when the
+  manager had no branch lineage for the inputs, such as a fresh `Prolly` or
+  `AsyncProlly`. Trees already written with such a root are not rewritten.
 - Add a native, source-bound TurboQuant-MSE proximity accelerator with
   deterministic structured rotation, fixed two/three/four-bit Lloyd-Max
   codebooks, authoritative reranking, SIMD scoring, async/catalog/composite/

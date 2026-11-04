@@ -1941,7 +1941,19 @@ pub(crate) fn append_tree_suffix<M: CanonicalWriteManager>(
     let mut source_from = reused_from;
     let mut internal_nodes = Vec::<EmittedNode>::new();
     let mut level = 1u8;
+    let remaining_suffix_leaves = suffix_leaves.len().saturating_sub(reused_from);
     let root = loop {
+        // Each pass emits a parent level, so a single-leaf destination whose
+        // appended contents still fit in one leaf must stop before the first
+        // pass; otherwise the root gains a non-canonical one-child parent.
+        if level == 1 && path.is_empty() && boundary.len() + remaining_suffix_leaves == 1 {
+            break boundary
+                .first()
+                .or_else(|| suffix_leaves.get(reused_from))
+                .ok_or(Error::InvalidNode)?
+                .cid
+                .clone();
+        }
         let source_children = suffix_levels
             .get(usize::from(level - 1))
             .map(Vec::as_slice)

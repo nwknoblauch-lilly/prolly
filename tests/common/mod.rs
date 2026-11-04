@@ -518,6 +518,11 @@ where
     S::Error: std::fmt::Debug,
 {
     if let Some(root) = &tree.root {
+        let root_node = load_node(store, root);
+        assert!(
+            root_node.leaf || root_node.keys.len() >= 2,
+            "canonical internal roots have at least two children"
+        );
         let (_, first_key) = assert_node_invariants(store, root, None, config);
         assert!(first_key.is_some());
     }

@@ -439,6 +439,39 @@ fn disjoint_merge_converges_to_the_direct_canonical_root() {
     assert_eq!(merged.root, direct.root);
 }
 
+/// Poll a future over an always-ready store to completion.
+fn ready<F: std::future::Future>(future: F) -> F::Output {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::pin::pin!(future).poll(&mut context) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => panic!("ready store future returned Pending"),
+    }
+}
+
+#[test]
+fn append_merge_into_a_single_leaf_keeps_the_canonical_leaf_root() {
+    let store = Arc::new(MemStore::new());
+    let config = Config::default();
+    let writer = Prolly::new(store.clone(), config.clone());
+    let base = writer
+        .put(&writer.create(), b"k".to_vec(), b"base".to_vec())
+        .unwrap();
+    let left = writer.put(&base, b"l".to_vec(), b"L".to_vec()).unwrap();
+    let right = writer.put(&base, b"r".to_vec(), b"R".to_vec()).unwrap();
+    let direct = writer.put(&left, b"r".to_vec(), b"R".to_vec()).unwrap();
+
+    // Fresh managers have no branch lineage for these trees, so they take the
+    // append-only diff merge path instead of lineage replay.
+    let sync = Prolly::new(store.clone(), config.clone())
+        .merge(&base, &left, &right, None)
+        .unwrap();
+    let async_prolly = prolly::AsyncProlly::new(prolly::SyncStoreAsAsync::new(store), config);
+    let async_merged = ready(async_prolly.merge(&base, &left, &right, None)).unwrap();
+
+    assert_eq!(sync.root, direct.root);
+    assert_eq!(async_merged.root, direct.root);
+}
+
 #[test]
 fn chained_append_batches_match_the_bulk_root() {
     for policy in [
