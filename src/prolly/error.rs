@@ -59,6 +59,23 @@ impl Diff {
     }
 }
 
+/// One difference found by a recursive diff across tree-valued references.
+///
+/// `path` lists the parent keys whose values are [`ValueRef::Tree`](crate::ValueRef::Tree)
+/// references leading to the tree that holds `diff.key()`; it is empty for a
+/// top-level key. A parent entry is expanded only when its old and new values
+/// are both tree references with the same persisted format. Any other change,
+/// including a subtree that is added, removed, replaced by a non-tree value, or
+/// re-referenced under another format, is reported as one entry at the parent
+/// key carrying the stored envelope bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NestedDiff {
+    /// Parent keys leading to the tree that holds `diff`.
+    pub path: Vec<Vec<u8>>,
+    /// The difference inside that tree.
+    pub diff: Diff,
+}
+
 /// Merge conflict information
 ///
 /// Contains all the information needed to resolve a conflict during a three-way merge.
@@ -73,6 +90,18 @@ pub struct Conflict {
     pub left: Option<Vec<u8>>,
     /// The value in the right tree (None if the key is absent)
     pub right: Option<Vec<u8>>,
+}
+
+/// A conflict found by a recursive merge, located by its parent-key path.
+///
+/// `path` lists the parent keys whose tree-valued references lead to the tree
+/// that holds `conflict.key`; it is empty for a top-level key.
+#[derive(Clone, Debug)]
+pub struct NestedConflict {
+    /// Parent keys leading to the tree that holds `conflict`.
+    pub path: Vec<Vec<u8>>,
+    /// The conflict inside that tree.
+    pub conflict: Conflict,
 }
 
 /// Resolution for a standard three-way merge conflict.
@@ -146,6 +175,13 @@ impl Resolution {
 /// });
 /// ```
 pub type Resolver = Box<dyn Fn(&Conflict) -> Resolution + Send + Sync>;
+
+/// Conflict resolution strategy for recursive merges.
+///
+/// Called for every conflict that a recursive merge cannot settle by merging
+/// child trees. [`Resolution::Unresolved`] fails the merge with
+/// [`Error::NestedConflict`].
+pub type NestedResolver = Box<dyn Fn(&NestedConflict) -> Resolution + Send + Sync>;
 
 /// Ready-made standard merge resolvers.
 pub mod resolver {
@@ -269,6 +305,8 @@ pub enum Error {
     /// and no resolver is provided or the resolver returns `Resolution::Unresolved`
     ///
     Conflict(Conflict),
+    /// Recursive merge conflict that no child-tree merge or resolver settled.
+    NestedConflict(Box<NestedConflict>),
     /// Mutation buffer is full - adding a mutation would exceed the buffer size limit
     BufferFull,
     /// A savepoint belongs to another write-session generation.
@@ -482,6 +520,11 @@ impl std::fmt::Display for Error {
                 )
             }
             Error::Conflict(c) => write!(f, "merge conflict at key: {:?}", c.key),
+            Error::NestedConflict(nested) => write!(
+                f,
+                "nested merge conflict at depth {}",
+                nested.path.len()
+            ),
             Error::BufferFull => write!(f, "mutation buffer is full"),
             Error::InvalidSavepoint => write!(f, "invalid or stale write-session savepoint"),
             Error::PatchBaseMismatch => write!(f, "patch base root or values do not match"),

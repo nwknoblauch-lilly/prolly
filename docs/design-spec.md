@@ -332,7 +332,10 @@ ValueRef::Tree(TreeRef)
 `ValueRef::Tree` refers to another immutable ordered tree by optional root CID
 and persisted `TreeFormat`. Reachability, GC, node copy, and snapshot export and
 verification follow it; raw reads, flat diff and merge, and cardinality treat
-it as one opaque value.
+it as one opaque value. The opt-in `diff_recursive` and `merge_recursive`
+operations descend into an entry whose compared values are both tree
+references with the same persisted format, and report nested changes and
+conflicts with their parent-key path.
 
 A blob reference should contain enough information to retrieve and validate the
 payload. Blob bytes may live in a different store from tree nodes.

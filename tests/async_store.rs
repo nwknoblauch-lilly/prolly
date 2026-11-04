@@ -3526,6 +3526,147 @@ fn async_prolly_runs_over_tokio_blocking_store() {
     assert_tree_invariants(&store, &tree, &config);
 }
 
+type AsyncMemStore = SyncStoreAsAsync<Arc<MemStore>>;
+
+/// Descends when possible and stores other conflicts as a written tree.
+struct AlternativesPolicy;
+
+impl prolly::AsyncNestedMergePolicy<AsyncMemStore> for AlternativesPolicy {
+    async fn on_conflict(
+        &self,
+        prolly: &AsyncProlly<AsyncMemStore>,
+        nested: &prolly::NestedConflict,
+        descendable: bool,
+    ) -> Result<prolly::NestedDecision, Error> {
+        if descendable {
+            return Ok(prolly::NestedDecision::Descend);
+        }
+        let conflict = &nested.conflict;
+        let mut alternatives = prolly.create();
+        let sides: [(&[u8], _); 2] = [(b"left", &conflict.left), (b"right", &conflict.right)];
+        for (side, value) in sides {
+            if let Some(value) = value {
+                alternatives = prolly
+                    .put(&alternatives, side.to_vec(), value.clone())
+                    .await?;
+            }
+        }
+        Ok(prolly::NestedDecision::Value(
+            ValueRef::Tree(prolly::TreeRef::try_from(&alternatives)?).to_bytes(),
+        ))
+    }
+}
+
+#[test]
+fn async_recursive_merge_policy_writes_nodes_with_send_futures() {
+    fn assert_send<T: Send>(value: T) -> T {
+        value
+    }
+    block_on(async {
+        let prolly = AsyncProlly::new(
+            SyncStoreAsAsync::new(Arc::new(MemStore::new())),
+            Config::default(),
+        );
+        let reference = |tree: &prolly::Tree| {
+            ValueRef::Tree(prolly::TreeRef::try_from(tree).unwrap()).to_bytes()
+        };
+        let child = prolly
+            .put(&prolly.create(), b"k".to_vec(), b"base".to_vec())
+            .await
+            .unwrap();
+        let left_child = prolly
+            .put(&child, b"k".to_vec(), b"L".to_vec())
+            .await
+            .unwrap();
+        let right_child = prolly
+            .put(&child, b"k".to_vec(), b"R".to_vec())
+            .await
+            .unwrap();
+        let base = prolly
+            .put(&prolly.create(), b"dir".to_vec(), reference(&child))
+            .await
+            .unwrap();
+        let left = prolly
+            .put(&base, b"dir".to_vec(), reference(&left_child))
+            .await
+            .unwrap();
+        let right = prolly
+            .put(&base, b"dir".to_vec(), reference(&right_child))
+            .await
+            .unwrap();
+
+        let merged =
+            assert_send(prolly.merge_recursive_with(&base, &left, &right, &AlternativesPolicy))
+                .await
+                .unwrap();
+        let Some(ValueRef::Tree(dir)) = prolly.get_value_ref(&merged, b"dir").await.unwrap() else {
+            panic!("expected a tree reference");
+        };
+        let dir = dir.to_tree(Default::default());
+        let Some(ValueRef::Tree(alternatives)) = prolly.get_value_ref(&dir, b"k").await.unwrap()
+        else {
+            panic!("expected a tree reference");
+        };
+        let alternatives = alternatives.to_tree(Default::default());
+        assert_eq!(
+            prolly.get(&alternatives, b"left").await.unwrap(),
+            Some(b"L".to_vec())
+        );
+        assert_eq!(
+            prolly.get(&alternatives, b"right").await.unwrap(),
+            Some(b"R".to_vec())
+        );
+    });
+}
+
+#[test]
+fn async_recursive_diff_and_merge_match_sync() {
+    fn assert_send<T: Send>(value: T) -> T {
+        value
+    }
+    block_on(async {
+        let store = Arc::new(MemStore::new());
+        let config = Config::default();
+        let sync = Prolly::new(store.clone(), config.clone());
+        let reference = |tree: &prolly::Tree| {
+            ValueRef::Tree(prolly::TreeRef::try_from(tree).unwrap()).to_bytes()
+        };
+        let child = sync
+            .put(&sync.create(), b"k".to_vec(), b"base".to_vec())
+            .unwrap();
+        let left_child = sync.put(&child, b"l".to_vec(), b"L".to_vec()).unwrap();
+        let right_child = sync.put(&child, b"r".to_vec(), b"R".to_vec()).unwrap();
+        let base = sync
+            .put(&sync.create(), b"dir".to_vec(), reference(&child))
+            .unwrap();
+        let left = sync
+            .put(&base, b"dir".to_vec(), reference(&left_child))
+            .unwrap();
+        let right = sync
+            .put(&base, b"dir".to_vec(), reference(&right_child))
+            .unwrap();
+
+        let async_prolly = AsyncProlly::new(SyncStoreAsAsync::new(store), config);
+        let diffs = assert_send(async_prolly.diff_recursive(&base, &left))
+            .await
+            .unwrap();
+        assert_eq!(diffs, sync.diff_recursive(&base, &left).unwrap());
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, vec![b"dir".to_vec()]);
+
+        let merged = assert_send(async_prolly.merge_recursive(&base, &left, &right, None))
+            .await
+            .unwrap();
+        let expected = sync.merge_recursive(&base, &left, &right, None).unwrap();
+        assert_eq!(merged.root, expected.root);
+        let Some(ValueRef::Tree(found)) = sync.get_value_ref(&merged, b"dir").unwrap() else {
+            panic!("expected a tree reference");
+        };
+        let merged_child = found.to_tree(Default::default());
+        assert_eq!(sync.len(&merged_child).unwrap(), 3);
+    });
+}
+
 #[test]
 fn async_closure_operations_follow_tree_refs_like_sync() {
     block_on(async {

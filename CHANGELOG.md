@@ -6,6 +6,12 @@
   leaf in a one-child internal root and return a non-canonical root when the
   manager had no branch lineage for the inputs, such as a fresh `Prolly` or
   `AsyncProlly`. Trees already written with such a root are not rewritten.
+- Add `diff_recursive`, `merge_recursive`, and `merge_recursive_with` on
+  `Prolly` and `AsyncProlly`, which descend into same-format `ValueRef::Tree`
+  entries. They add the `NestedDiff`, `NestedConflict`, `NestedResolver`, and
+  `NestedDecision` types, the `NestedMergePolicy` and `AsyncNestedMergePolicy`
+  traits, and the `Error::NestedConflict` variant. Flat diff and merge are
+  unchanged, and language bindings do not expose the recursive operations yet.
 - Add a native, source-bound TurboQuant-MSE proximity accelerator with
   deterministic structured rotation, fixed two/three/four-bit Lloyd-Max
   codebooks, authoritative reranking, SIMD scoring, async/catalog/composite/

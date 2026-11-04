@@ -169,6 +169,7 @@ pub mod batch;
 pub mod blob;
 pub mod crdt;
 pub mod diff;
+pub(crate) mod nested;
 pub mod parallel;
 pub mod range;
 pub(crate) mod range_delete;

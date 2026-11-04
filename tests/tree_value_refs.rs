@@ -5,9 +5,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use prolly::{
-    walk_content_graph, Cid, Config, ContentGraphLimits, ContentObjectKind, Error,
-    LargeValueConfig, MemBlobStore, MemStore, Mutation, Node, NodeLayoutSpec, Prolly,
-    RuntimeConfig, Store, Tree, TreeFormat, TreeRef, TypedContentRoot, ValueRef, ValueRefView,
+    walk_content_graph, Cid, Config, ContentGraphLimits, ContentObjectKind, Diff, Error,
+    LargeValueConfig, MemBlobStore, MemStore, Mutation, NestedConflict, NestedDecision,
+    NestedMergePolicy, Node, NodeLayoutSpec, Prolly, Resolution, RuntimeConfig, Store, Tree,
+    TreeFormat, TreeRef, TypedContentRoot, ValueRef, ValueRefView,
 };
 
 fn small_config() -> Config {
@@ -782,4 +783,406 @@ fn typed_walk_depth_limits_cover_longer_paths_through_shared_objects() {
             );
         }
     }
+}
+
+fn put_all<S: Store>(prolly: &Prolly<S>, tree: &Tree, entries: &[(&[u8], Vec<u8>)]) -> Tree {
+    let mut tree = tree.clone();
+    for (key, value) in entries {
+        tree = prolly.put(&tree, key.to_vec(), value.clone()).unwrap();
+    }
+    tree
+}
+
+fn child_at<S: Store>(prolly: &Prolly<S>, parent: &Tree, key: &[u8]) -> Tree {
+    match prolly.get_value_ref(parent, key).unwrap() {
+        Some(ValueRef::Tree(reference)) => reference.to_tree(RuntimeConfig::default()),
+        other => panic!("expected a tree reference at {key:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn recursive_diff_descends_same_format_tree_changes_in_key_order() {
+    let prolly = Prolly::new(Arc::new(MemStore::new()), small_config());
+    let empty = prolly.create();
+    let leaf = put_all(&prolly, &empty, &[(b"x", b"1".to_vec())]);
+    let edited_leaf = put_all(&prolly, &leaf, &[(b"x", b"2".to_vec())]);
+    let mid = put_all(&prolly, &empty, &[(b"leaf", tree_value(&leaf))]);
+    let edited_mid = put_all(
+        &prolly,
+        &mid,
+        &[(b"leaf", tree_value(&edited_leaf)), (b"m", b"new".to_vec())],
+    );
+    let added = build_tree(&prolly, "added", 20);
+    let before = put_all(
+        &prolly,
+        &empty,
+        &[
+            (b"a", b"old".to_vec()),
+            (b"b", tree_value(&mid)),
+            (b"d", tree_value(&leaf)),
+        ],
+    );
+    let after = put_all(
+        &prolly,
+        &before,
+        &[
+            (b"a", b"new".to_vec()),
+            (b"b", tree_value(&edited_mid)),
+            (b"c", tree_value(&added)),
+            (b"d", b"inline".to_vec()),
+        ],
+    );
+
+    let diffs = prolly.diff_recursive(&before, &after).unwrap();
+    let summary: Vec<_> = diffs
+        .iter()
+        .map(|nested| (nested.path.clone(), nested.diff.key().to_vec()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (vec![], b"a".to_vec()),
+            (vec![b"b".to_vec(), b"leaf".to_vec()], b"x".to_vec()),
+            (vec![b"b".to_vec()], b"m".to_vec()),
+            (vec![], b"c".to_vec()),
+            (vec![], b"d".to_vec()),
+        ]
+    );
+    assert_eq!(
+        diffs[1].diff,
+        Diff::Changed {
+            key: b"x".to_vec(),
+            old: b"1".to_vec(),
+            new: b"2".to_vec(),
+        }
+    );
+    // Added subtrees and tree-to-inline replacements stay one parent entry.
+    assert_eq!(
+        diffs[3].diff,
+        Diff::Added {
+            key: b"c".to_vec(),
+            val: tree_value(&added),
+        }
+    );
+    assert_eq!(
+        diffs[4].diff,
+        Diff::Changed {
+            key: b"d".to_vec(),
+            old: tree_value(&leaf),
+            new: b"inline".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn recursive_diff_keeps_cross_format_reference_changes_flat() {
+    let store = Arc::new(MemStore::new());
+    let prolly = Prolly::new(store.clone(), small_config());
+    let plain = Prolly::new(store, plain_config());
+    let child = build_tree(&prolly, "child", 6);
+    let plain_child = build_tree(&plain, "child", 6);
+    let before = put_all(&prolly, &prolly.create(), &[(b"ref", tree_value(&child))]);
+    let after = put_all(&prolly, &before, &[(b"ref", tree_value(&plain_child))]);
+
+    let diffs = prolly.diff_recursive(&before, &after).unwrap();
+    assert_eq!(diffs.len(), 1);
+    assert!(diffs[0].path.is_empty());
+    assert_eq!(
+        diffs[0].diff,
+        Diff::Changed {
+            key: b"ref".to_vec(),
+            old: tree_value(&child),
+            new: tree_value(&plain_child),
+        }
+    );
+}
+
+#[test]
+fn recursive_merge_combines_concurrent_edits_inside_nested_trees() {
+    let prolly = Prolly::new(Arc::new(MemStore::new()), small_config());
+    let empty = prolly.create();
+    let leaf = build_tree(&prolly, "leaf", 10);
+    let mid = put_all(&prolly, &empty, &[(b"leaf", tree_value(&leaf))]);
+    let base = put_all(&prolly, &empty, &[(b"dir", tree_value(&mid))]);
+
+    let left_leaf = put_all(&prolly, &leaf, &[(b"left", b"L".to_vec())]);
+    let right_leaf = put_all(&prolly, &leaf, &[(b"right", b"R".to_vec())]);
+    let left_mid = put_all(
+        &prolly,
+        &mid,
+        &[
+            (b"leaf", tree_value(&left_leaf)),
+            (b"left-mid", b"L".to_vec()),
+        ],
+    );
+    let right_mid = put_all(&prolly, &mid, &[(b"leaf", tree_value(&right_leaf))]);
+    let left = put_all(&prolly, &base, &[(b"dir", tree_value(&left_mid))]);
+    let right = put_all(
+        &prolly,
+        &base,
+        &[(b"dir", tree_value(&right_mid)), (b"top", b"R".to_vec())],
+    );
+
+    assert!(matches!(
+        prolly.merge(&base, &left, &right, None),
+        Err(Error::Conflict(_))
+    ));
+    let merged = prolly.merge_recursive(&base, &left, &right, None).unwrap();
+
+    assert_eq!(prolly.get(&merged, b"top").unwrap(), Some(b"R".to_vec()));
+    let merged_mid = child_at(&prolly, &merged, b"dir");
+    assert_eq!(
+        prolly.get(&merged_mid, b"left-mid").unwrap(),
+        Some(b"L".to_vec())
+    );
+    let merged_leaf = child_at(&prolly, &merged_mid, b"leaf");
+    assert_eq!(
+        prolly.get(&merged_leaf, b"left").unwrap(),
+        Some(b"L".to_vec())
+    );
+    assert_eq!(
+        prolly.get(&merged_leaf, b"right").unwrap(),
+        Some(b"R".to_vec())
+    );
+    assert_eq!(prolly.len(&merged_leaf).unwrap(), 12);
+}
+
+#[test]
+fn recursive_merge_reports_and_resolves_nested_conflicts_by_path() {
+    let prolly = Prolly::new(Arc::new(MemStore::new()), small_config());
+    let empty = prolly.create();
+    let child = put_all(&prolly, &empty, &[(b"k", b"base".to_vec())]);
+    let base = put_all(
+        &prolly,
+        &empty,
+        &[(b"dir", tree_value(&child)), (b"flat", b"base".to_vec())],
+    );
+    let left_child = put_all(&prolly, &child, &[(b"k", b"left".to_vec())]);
+    let right_child = put_all(&prolly, &child, &[(b"k", b"right".to_vec())]);
+    let left = put_all(&prolly, &base, &[(b"dir", tree_value(&left_child))]);
+    let right = put_all(&prolly, &base, &[(b"dir", tree_value(&right_child))]);
+
+    let Err(Error::NestedConflict(nested)) = prolly.merge_recursive(&base, &left, &right, None)
+    else {
+        panic!("expected a nested conflict");
+    };
+    assert_eq!(nested.path, vec![b"dir".to_vec()]);
+    assert_eq!(nested.conflict.key, b"k".to_vec());
+    assert_eq!(nested.conflict.base, Some(b"base".to_vec()));
+    assert_eq!(nested.conflict.left, Some(b"left".to_vec()));
+    assert_eq!(nested.conflict.right, Some(b"right".to_vec()));
+
+    let left = put_all(&prolly, &left, &[(b"flat", b"left".to_vec())]);
+    let right = put_all(&prolly, &right, &[(b"flat", b"right".to_vec())]);
+    let merged = prolly
+        .merge_recursive(
+            &base,
+            &left,
+            &right,
+            Some(Box::new(|nested| {
+                let mut value = nested.path.concat();
+                value.extend_from_slice(b":");
+                value.extend_from_slice(nested.conflict.right.as_deref().unwrap());
+                Resolution::Value(value)
+            })),
+        )
+        .unwrap();
+    assert_eq!(
+        prolly.get(&merged, b"flat").unwrap(),
+        Some(b":right".to_vec())
+    );
+    let merged_child = child_at(&prolly, &merged, b"dir");
+    assert_eq!(
+        prolly.get(&merged_child, b"k").unwrap(),
+        Some(b"dir:right".to_vec())
+    );
+}
+
+#[test]
+fn recursive_merge_unions_trees_added_without_a_base_tree() {
+    let prolly = Prolly::new(Arc::new(MemStore::new()), small_config());
+    let empty = prolly.create();
+    let base = put_all(&prolly, &empty, &[(b"other", b"1".to_vec())]);
+    let left_child = build_tree(&prolly, "left", 8);
+    let right_child = build_tree(&prolly, "right", 8);
+    let left = put_all(&prolly, &base, &[(b"dir", tree_value(&left_child))]);
+    let right = put_all(&prolly, &base, &[(b"dir", tree_value(&right_child))]);
+
+    let merged = prolly.merge_recursive(&base, &left, &right, None).unwrap();
+    let merged_child = child_at(&prolly, &merged, b"dir");
+    assert_eq!(prolly.len(&merged_child).unwrap(), 16);
+    assert_eq!(
+        prolly.get(&merged_child, b"left/0003").unwrap(),
+        Some(b"value-left-3".to_vec())
+    );
+    assert_eq!(
+        prolly.get(&merged_child, b"right/0007").unwrap(),
+        Some(b"value-right-7".to_vec())
+    );
+}
+
+type PolicyCall = (Vec<Vec<u8>>, Vec<u8>, bool);
+
+/// Records every call, descends into `dir`, keeps `opaque` from the left
+/// without descending, deletes `gone`, and stores any other conflict as a
+/// written tree holding both alternatives.
+struct RecordingPolicy {
+    calls: std::sync::Mutex<Vec<PolicyCall>>,
+}
+
+impl NestedMergePolicy<MemStore> for RecordingPolicy {
+    fn on_conflict(
+        &self,
+        prolly: &Prolly<MemStore>,
+        nested: &NestedConflict,
+        descendable: bool,
+    ) -> Result<NestedDecision, Error> {
+        let conflict = &nested.conflict;
+        self.calls
+            .lock()
+            .unwrap()
+            .push((nested.path.clone(), conflict.key.clone(), descendable));
+        Ok(match conflict.key.as_slice() {
+            b"dir" => NestedDecision::Descend,
+            b"opaque" => NestedDecision::Value(conflict.left.clone().unwrap()),
+            b"gone" => NestedDecision::Delete,
+            _ => {
+                let mut alternatives = prolly.create();
+                let sides: [(&[u8], _); 2] =
+                    [(b"left", &conflict.left), (b"right", &conflict.right)];
+                for (side, value) in sides {
+                    if let Some(value) = value {
+                        alternatives = prolly.put(&alternatives, side.to_vec(), value.clone())?;
+                    }
+                }
+                NestedDecision::Value(tree_value(&alternatives))
+            }
+        })
+    }
+}
+
+#[test]
+fn recursive_merge_policy_decides_each_true_conflict_once() {
+    let prolly = Prolly::new(MemStore::new(), small_config());
+    let empty = prolly.create();
+    let child = put_all(&prolly, &empty, &[(b"k", b"base".to_vec())]);
+    let opaque = put_all(&prolly, &empty, &[(b"o", b"base".to_vec())]);
+    let base = put_all(
+        &prolly,
+        &empty,
+        &[
+            (b"dir", tree_value(&child)),
+            (b"gone", b"base".to_vec()),
+            (b"opaque", tree_value(&opaque)),
+            (b"same", b"base".to_vec()),
+        ],
+    );
+    let left_opaque = put_all(&prolly, &opaque, &[(b"o", b"left".to_vec())]);
+    let right_opaque = put_all(&prolly, &opaque, &[(b"p", b"right".to_vec())]);
+    let left = put_all(
+        &prolly,
+        &base,
+        &[
+            (
+                b"dir",
+                tree_value(&put_all(&prolly, &child, &[(b"k", b"left".to_vec())])),
+            ),
+            (b"gone", b"left".to_vec()),
+            (b"opaque", tree_value(&left_opaque)),
+            (b"same", b"both".to_vec()),
+            (b"only-left", b"L".to_vec()),
+        ],
+    );
+    let right = prolly.delete(&base, b"gone").unwrap();
+    let right = put_all(
+        &prolly,
+        &right,
+        &[
+            (
+                b"dir",
+                tree_value(&put_all(&prolly, &child, &[(b"k", b"right".to_vec())])),
+            ),
+            (b"opaque", tree_value(&right_opaque)),
+            (b"same", b"both".to_vec()),
+        ],
+    );
+
+    let policy = RecordingPolicy {
+        calls: std::sync::Mutex::new(Vec::new()),
+    };
+    let merged = prolly
+        .merge_recursive_with(&base, &left, &right, &policy)
+        .unwrap();
+
+    // One call per true conflict, depth first; one-sided and identical
+    // changes never reach the policy.
+    assert_eq!(
+        policy.calls.into_inner().unwrap(),
+        vec![
+            (vec![], b"dir".to_vec(), true),
+            (vec![b"dir".to_vec()], b"k".to_vec(), false),
+            (vec![], b"gone".to_vec(), false),
+            (vec![], b"opaque".to_vec(), true),
+        ]
+    );
+    assert_eq!(
+        prolly.get(&merged, b"only-left").unwrap(),
+        Some(b"L".to_vec())
+    );
+    assert_eq!(
+        prolly.get(&merged, b"same").unwrap(),
+        Some(b"both".to_vec())
+    );
+    assert_eq!(prolly.get(&merged, b"gone").unwrap(), None);
+    assert_eq!(
+        prolly.get(&merged, b"opaque").unwrap(),
+        Some(tree_value(&left_opaque))
+    );
+    // The node written by the policy is referenced from the merged child.
+    let alternatives = child_at(&prolly, &child_at(&prolly, &merged, b"dir"), b"k");
+    assert_eq!(
+        prolly.get(&alternatives, b"left").unwrap(),
+        Some(b"left".to_vec())
+    );
+    assert_eq!(
+        prolly.get(&alternatives, b"right").unwrap(),
+        Some(b"right".to_vec())
+    );
+}
+
+struct FixedPolicy(fn() -> Result<NestedDecision, Error>);
+
+impl NestedMergePolicy<MemStore> for FixedPolicy {
+    fn on_conflict(
+        &self,
+        _prolly: &Prolly<MemStore>,
+        _conflict: &NestedConflict,
+        _descendable: bool,
+    ) -> Result<NestedDecision, Error> {
+        (self.0)()
+    }
+}
+
+#[test]
+fn recursive_merge_policy_errors_and_invalid_descent_abort_the_merge() {
+    let prolly = Prolly::new(MemStore::new(), small_config());
+    let base = put_all(&prolly, &prolly.create(), &[(b"k", b"base".to_vec())]);
+    let left = put_all(&prolly, &base, &[(b"k", b"left".to_vec())]);
+    let right = put_all(&prolly, &base, &[(b"k", b"right".to_vec())]);
+
+    let failing = FixedPolicy(|| Err(Error::InvalidVersionedMap("policy failed".to_string())));
+    assert!(matches!(
+        prolly.merge_recursive_with(&base, &left, &right, &failing),
+        Err(Error::InvalidVersionedMap(message)) if message == "policy failed"
+    ));
+    let descending = FixedPolicy(|| Ok(NestedDecision::Descend));
+    assert!(matches!(
+        prolly.merge_recursive_with(&base, &left, &right, &descending),
+        Err(Error::InvalidFormat(_))
+    ));
+    let unresolved = FixedPolicy(|| Ok(NestedDecision::Unresolved));
+    assert!(matches!(
+        prolly.merge_recursive_with(&base, &left, &right, &unresolved),
+        Err(Error::NestedConflict(nested)) if nested.conflict.key == b"k"
+    ));
 }

@@ -298,7 +298,8 @@ pub use prolly::encoding::Encoding;
 pub use prolly::engine::execution::ExecutionConfig;
 pub use prolly::engine::ProllyEngine;
 pub use prolly::error::{
-    resolver, Conflict, Diff, Error, IndexErrorCode, Mutation, Resolution, Resolver, RetryAdvice,
+    resolver, Conflict, Diff, Error, IndexErrorCode, Mutation, NestedConflict, NestedDiff,
+    NestedResolver, Resolution, Resolver, RetryAdvice,
 };
 pub use prolly::format::{
     BoundaryInput, BoundaryRule, ChunkMeasure, ChunkingSpec, HashAlgorithm, NodeLayoutSpec,
@@ -317,6 +318,7 @@ pub use prolly::manifest::{
     ManifestStore, ManifestStoreScan, ManifestUpdate, NamedRoot, NamedRootManifest,
     NamedRootManifestPage, NamedRootRetention, NamedRootSelection, NamedRootUpdate, RootManifest,
 };
+pub use prolly::nested::{AsyncNestedMergePolicy, NestedDecision, NestedMergePolicy};
 pub use prolly::node::{Node, NodeBuilder};
 pub use prolly::parallel::ParallelConfig;
 pub use prolly::patch::{LogicalPatch, StructuralEdit, StructuralPatch};

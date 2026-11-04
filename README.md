@@ -1355,6 +1355,27 @@ store application bytes that begin with `PLVB` through `put_large_value` or an
 explicit `ValueRef::Inline` escape. Node-only APIs copy nodes, not blob-store
 payloads.
 
+`diff_recursive` and `merge_recursive` (on `Prolly` and `AsyncProlly`) open
+child trees on request. They descend into an entry only when both compared
+values are tree references with the same persisted format. `diff_recursive`
+returns `NestedDiff` records whose `path` lists the parent keys leading to the
+changed entry. A subtree that is added, removed, replaced by a non-tree value,
+or re-referenced under another format stays one entry at the parent key.
+`merge_recursive` settles a conflicting pair of child trees by merging them
+against the base child, or an empty tree when the base has none, and stores a
+reference to the result. Other conflicts go to a `NestedResolver`, which
+receives a `NestedConflict` with its parent-key path. An unresolved conflict
+fails with `Error::NestedConflict`.
+
+`merge_recursive_with` replaces those fixed rules with a `NestedMergePolicy`
+(or `AsyncNestedMergePolicy`, whose futures must be `Send`). Its `on_conflict`
+method is called once for each true conflict, before any descent. It is told
+whether the pair can be descended into and answers `Descend`, `Value`,
+`Delete`, or `Unresolved`. Keys changed on one side, or identically on both,
+never reach the policy. The policy may write nodes through the manager it
+receives, for example to build a conflict value; nodes left unused by a failed
+merge are only unreferenced. An `Err` from the policy aborts the merge.
+
 Upgrade every process that runs GC or closure verification before writing tree
 references to shared stores. Older `ValueRef` decoders reject tag 2, but older
 node GC does not inspect leaf values and would treat referenced child trees as
