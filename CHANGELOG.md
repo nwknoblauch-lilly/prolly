@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add `Prolly::with_shared_cache` and `AsyncProlly::with_shared_cache`, which
+  build a manager over another store that shares the decoded-node cache, for
+  per-operation store wrappers around one backend.
 - Fix append-only merges into a single-leaf tree, which could wrap the merged
   leaf in a one-child internal root and return a non-canonical root when the
   manager had no branch lineage for the inputs, such as a fresh `Prolly` or

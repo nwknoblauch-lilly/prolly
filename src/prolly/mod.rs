@@ -1465,6 +1465,39 @@ impl<S: Store> Prolly<S> {
         }
     }
 
+    /// Create a manager over `store` that shares this manager's decoded-node
+    /// cache.
+    ///
+    /// This mirrors [`AsyncProlly::with_shared_cache`], including its
+    /// requirement that both stores read and persist the same backing content.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, Prolly};
+    /// use std::sync::Arc;
+    ///
+    /// let backend = Arc::new(MemStore::new());
+    /// let prolly = Prolly::new(backend.clone(), Config::default());
+    /// let tree = prolly.put(&prolly.create(), b"k".to_vec(), b"v".to_vec()).unwrap();
+    /// prolly.get(&tree, b"k").unwrap();
+    ///
+    /// // A per-operation manager over the same backend starts warm.
+    /// let scoped = prolly.with_shared_cache(backend);
+    /// assert_eq!(scoped.get(&tree, b"k").unwrap(), Some(b"v".to_vec()));
+    /// assert_eq!(scoped.metrics().node_cache_misses, 0);
+    /// ```
+    pub fn with_shared_cache<T: Store>(&self, store: T) -> Prolly<T> {
+        Prolly {
+            engine: self
+                .engine
+                .with_shared_cache(SyncStoreAsAsync::new(Arc::new(store))),
+            #[cfg(test)]
+            recent_leaf: RwLock::new(None),
+            #[cfg(test)]
+            recent_leaf_misses: AtomicUsize::new(0),
+        }
+    }
+
     fn store_arc(&self) -> &Arc<S> {
         self.engine.store.inner()
     }

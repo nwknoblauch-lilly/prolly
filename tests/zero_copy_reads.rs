@@ -1009,3 +1009,72 @@ fn async_borrowed_reads_match_sync_results_without_owned_iterator_entries() {
         );
     });
 }
+
+fn shared_cache_config() -> Config {
+    Config::builder()
+        .min_chunk_size(2)
+        .max_chunk_size(4)
+        .chunking_factor(2)
+        .build()
+}
+
+fn read_all<S: Store>(prolly: &Prolly<S>, tree: &prolly::Tree, count: u32) {
+    for index in 0..count {
+        assert!(prolly.get(tree, &index.to_be_bytes()).unwrap().is_some());
+    }
+}
+
+#[test]
+fn shared_cache_managers_reuse_nodes_loaded_by_each_other() {
+    let backend = Arc::new(MemStore::new());
+    let prolly = Prolly::new(backend.clone(), shared_cache_config());
+    let mut tree = prolly.create();
+    for index in 0..200u32 {
+        tree = prolly
+            .put(&tree, index.to_be_bytes().to_vec(), b"v".to_vec())
+            .unwrap();
+    }
+    read_all(&prolly, &tree, 200);
+
+    let cold = Prolly::new(backend.clone(), shared_cache_config());
+    read_all(&cold, &tree, 200);
+    assert!(cold.metrics().node_cache_misses > 0);
+
+    let scoped = prolly.with_shared_cache(backend.clone());
+    read_all(&scoped, &tree, 200);
+    assert_eq!(scoped.metrics().node_cache_misses, 0);
+    assert!(scoped.metrics().node_cache_hits > 0);
+}
+
+#[cfg(feature = "async-store")]
+#[test]
+fn async_shared_cache_managers_reuse_loaded_nodes() {
+    block_on(async {
+        let backend = Arc::new(MemStore::new());
+        let sync = Prolly::new(backend.clone(), shared_cache_config());
+        let mut tree = sync.create();
+        for index in 0..200u32 {
+            tree = sync
+                .put(&tree, index.to_be_bytes().to_vec(), b"v".to_vec())
+                .unwrap();
+        }
+        let prolly = AsyncProlly::new(
+            SyncStoreAsAsync::new(backend.clone()),
+            shared_cache_config(),
+        );
+        for index in 0..200u32 {
+            prolly.get(&tree, &index.to_be_bytes()).await.unwrap();
+        }
+        assert!(prolly.metrics().node_cache_misses > 0);
+
+        let scoped = prolly.with_shared_cache(SyncStoreAsAsync::new(backend));
+        for index in 0..200u32 {
+            assert!(scoped
+                .get(&tree, &index.to_be_bytes())
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(scoped.metrics().node_cache_misses, 0);
+    });
+}

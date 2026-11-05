@@ -709,10 +709,11 @@ impl<'a, S: IndexedStore> IndexedMap<'a, S> {
                     current: Some(self.current_version(&loaded)?),
                 });
             }
+            let source_keys = normalized.keys().collect::<Vec<_>>();
+            let old_values = self.prolly.get_many(&head.source.tree, &source_keys)?;
             let mut source_entry_delta = 0i64;
-            for (key, mutation) in &normalized {
-                let existed = self.prolly.contains_key(&head.source.tree, key)?;
-                match (existed, mutation) {
+            for ((_, mutation), old) in normalized.iter().zip(&old_values) {
+                match (old.is_some(), mutation) {
                     (false, Mutation::Upsert { .. }) => source_entry_delta += 1,
                     (true, Mutation::Delete { .. }) => source_entry_delta -= 1,
                     _ => {}
@@ -722,6 +723,14 @@ impl<'a, S: IndexedStore> IndexedMap<'a, S> {
             let mut derived_entries = 0usize;
             let mut derived_bytes = 0usize;
             let mut accounted_memory = 0usize;
+            for old in old_values.iter().flatten() {
+                counter.charge(
+                    "mutation_accounted_memory_bytes",
+                    &mut accounted_memory,
+                    old.len(),
+                    budget.max_accounted_memory_bytes,
+                )?;
+            }
             let mut records_extracted = 0u64;
             let mut terms_emitted = 0u64;
             let mut projected_bytes = 0u64;
@@ -747,8 +756,7 @@ impl<'a, S: IndexedStore> IndexedMap<'a, S> {
                     })?;
                 let mut delta = BTreeMap::new();
                 let mut index_entry_delta = 0i64;
-                for (key, mutation) in &normalized {
-                    let old = self.prolly.get(&head.source.tree, key)?;
+                for ((key, mutation), old) in normalized.iter().zip(&old_values) {
                     let new = match mutation {
                         Mutation::Upsert { val, .. } => Some(val.as_slice()),
                         Mutation::Delete { .. } => None,

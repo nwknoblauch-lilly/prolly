@@ -63,6 +63,28 @@ where
         }
     }
 
+    /// Create an engine over `store` that shares this engine's decoded-node
+    /// cache.
+    ///
+    /// The new engine keeps this engine's config and execution limits and has
+    /// its own metrics, branch-lineage, and path caches. Cache hits skip the
+    /// store, so reads through either engine may be served by nodes cached
+    /// through the other. Share a cache only between stores that read
+    /// and persist the same backing content, such as per-operation wrappers
+    /// around one backend; otherwise a cached node can hide that `store` lacks
+    /// it. Cache maintenance such as [`clear_cache`](Self::clear_cache),
+    /// pinning, and cache usage reports applies to the shared cache.
+    pub fn with_shared_cache<T>(&self, store: T) -> ProllyEngine<T>
+    where
+        T: AsyncStore,
+        T::Error: Send + Sync,
+    {
+        let mut engine =
+            ProllyEngine::with_execution_config(store, self.config.clone(), self.execution.clone());
+        engine.node_cache = Arc::clone(&self.node_cache);
+        engine
+    }
+
     pub(crate) fn format_digest(&self) -> Result<Cid, Error> {
         if let Some(digest) = self.format_digest.get() {
             return Ok(digest.clone());

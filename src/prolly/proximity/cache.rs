@@ -34,7 +34,9 @@ impl<T> ContentCache<T> {
         self.generation = self.generation.wrapping_add(1);
         entry.generation = self.generation;
         self.access_log.push_back((cid.clone(), self.generation));
-        Some((entry.value.clone(), entry.bytes))
+        let result = (entry.value.clone(), entry.bytes);
+        self.compact_access_log_if_needed();
+        Some(result)
     }
 
     pub(crate) fn insert(&mut self, cid: Cid, value: Arc<T>, bytes: usize) {
@@ -63,6 +65,18 @@ impl<T> ContentCache<T> {
                 self.entries.remove(&candidate);
             }
         }
+        self.compact_access_log_if_needed();
+    }
+
+    fn compact_access_log_if_needed(&mut self) {
+        let max_log_len = self.entries.len().saturating_mul(4).max(64);
+        if self.access_log.len() > max_log_len {
+            self.access_log.retain(|(cid, generation)| {
+                self.entries
+                    .get(cid)
+                    .is_some_and(|entry| entry.generation == *generation)
+            });
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -74,6 +88,35 @@ impl<T> ContentCache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_content_cache_bounds_recency_for_hits_and_replacements() {
+        for replace in [false, true] {
+            let mut cache = ContentCache::new(2);
+            let one = Cid::from_bytes(b"one");
+            let two = Cid::from_bytes(b"two");
+            let three = Cid::from_bytes(b"three");
+            cache.insert(one.clone(), Arc::new(1u8), 1);
+            cache.insert(two.clone(), Arc::new(2u8), 2);
+            for _ in 0..1_024 {
+                if replace {
+                    cache.insert(one.clone(), Arc::new(3u8), 3);
+                } else {
+                    assert_eq!(cache.get(&one), Some((Arc::new(1u8), 1)));
+                }
+                assert!(cache.access_log.len() <= 64);
+                assert_eq!(cache.entries.len(), 2);
+            }
+            cache.insert(three.clone(), Arc::new(4u8), 4);
+            assert!(cache.get(&two).is_none());
+            let expected = if replace { 3 } else { 1 };
+            assert_eq!(
+                cache.get(&one),
+                Some((Arc::new(expected), expected as usize))
+            );
+            assert_eq!(cache.get(&three), Some((Arc::new(4u8), 4)));
+        }
+    }
 
     #[test]
     fn typed_content_cache_is_bounded_and_refreshes_recent_entries() {
